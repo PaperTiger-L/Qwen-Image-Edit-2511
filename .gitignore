@@ -1,0 +1,18 @@
+# Claude / local tooling
+.claude/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Generated outputs
+outputs/
+
+# Local model weights and assets
+model_index.json
+processor/
+scheduler/
+text_encoder/
+tokenizer/
+transformer/
+vae/

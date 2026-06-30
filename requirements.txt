@@ -1,0 +1,9 @@
+# torch
+gradio>=4.44.0
+# Pillow
+transformers>=4.57.1
+accelerate
+safetensors
+PyYAML>=6.0
+# git+https://github.com/huggingface/diffusers
+diffusers
