@@ -1,11 +1,17 @@
 import csv
 import functools
 import json
+import logging
 import os
+import shutil
 import stat
 import tempfile
+import threading
+import time
+import uuid
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, List, Optional
 
@@ -28,9 +34,18 @@ MODEL_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = MODEL_DIR / "outputs"
 BATCH_OUTPUT_DIR = OUTPUT_DIR / "batch"
 SINGLE_OUTPUT_DIR = OUTPUT_DIR / "single"
+RETENTION_DAYS = int(os.getenv("OUTPUT_RETENTION_DAYS", "7"))
+CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", str(6 * 60 * 60)))
+METADATA_FILENAME = "metadata.json"
+IN_PROGRESS_MARKER = ".in_progress"
+COMPLETED_MARKER = ".completed"
+FAILED_MARKER = ".failed"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 OUTPUT_DIR.mkdir(exist_ok=True)
 BATCH_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SINGLE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+LOGGER = logging.getLogger(__name__)
 
 _PIPELINE: Optional[QwenImageEditPlusPipeline] = None
 _DEVICE: Optional[str] = None
@@ -50,6 +65,176 @@ class BatchItem:
     num_inference_steps: int
     guidance_scale: float
     true_cfg_scale: float
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+
+def isoformat_utc(value: datetime) -> str:
+    return value.isoformat().replace("+00:00", "Z")
+
+
+
+def session_paths(session_dir: Path) -> tuple[Path, Path, Path, Path]:
+    return (
+        session_dir / METADATA_FILENAME,
+        session_dir / IN_PROGRESS_MARKER,
+        session_dir / COMPLETED_MARKER,
+        session_dir / FAILED_MARKER,
+    )
+
+
+
+def create_session_dir(root_dir: Path, prefix: str) -> Path:
+    timestamp = now_utc().strftime("%Y%m%dT%H%M%SZ")
+    suffix = uuid.uuid4().hex[:8]
+    session_dir = root_dir / f"{prefix}_{timestamp}_{suffix}"
+    session_dir.mkdir(parents=True, exist_ok=False)
+    return session_dir
+
+
+
+def write_session_metadata(session_dir: Path, metadata: dict[str, Any]) -> None:
+    metadata_path, _, _, _ = session_paths(session_dir)
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+
+
+def initialize_session(session_dir: Path, session_type: str, retention_days: int = RETENTION_DAYS) -> dict[str, Any]:
+    created_at = now_utc()
+    expire_at = created_at + timedelta(days=retention_days)
+    metadata = {
+        "session_type": session_type,
+        "status": "in_progress",
+        "created_at": isoformat_utc(created_at),
+        "finished_at": None,
+        "expire_at": isoformat_utc(expire_at),
+        "input_files": [],
+        "result_files": [],
+        "manifest_file": None,
+        "uploaded_package_file": None,
+        "extracted_package_dir": None,
+    }
+    metadata_path, in_progress_path, completed_path, failed_path = session_paths(session_dir)
+    completed_path.unlink(missing_ok=True)
+    failed_path.unlink(missing_ok=True)
+    in_progress_path.touch()
+    write_session_metadata(session_dir, metadata)
+    return metadata
+
+
+
+def finalize_session(session_dir: Path, metadata: dict[str, Any], status: str) -> None:
+    metadata["status"] = status
+    metadata["finished_at"] = isoformat_utc(now_utc())
+    write_session_metadata(session_dir, metadata)
+    _, in_progress_path, completed_path, failed_path = session_paths(session_dir)
+    in_progress_path.unlink(missing_ok=True)
+    if status == "completed":
+        completed_path.touch()
+        failed_path.unlink(missing_ok=True)
+    else:
+        failed_path.touch()
+        completed_path.unlink(missing_ok=True)
+
+
+
+def copy_file_to_dir(source: Path, target_dir: Path, target_name: Optional[str] = None) -> Path:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    destination = target_dir / (target_name or source.name)
+    shutil.copy2(source, destination)
+    return destination
+
+
+
+def local_path_from_input(file_obj) -> Path:
+    if isinstance(file_obj, Path):
+        return file_obj.resolve()
+    return Path(getattr(file_obj, "name", file_obj)).resolve()
+
+
+
+def cleanup_old_outputs() -> None:
+    now = now_utc()
+    LOGGER.info("Starting cleanup pass for retained outputs")
+    deleted_sessions = 0
+    skipped_in_progress = 0
+    deleted_legacy_files = 0
+
+    for session_root in (SINGLE_OUTPUT_DIR, BATCH_OUTPUT_DIR):
+        for path in session_root.iterdir():
+            if not path.is_dir():
+                continue
+
+            metadata_path, in_progress_path, completed_path, failed_path = session_paths(path)
+            if in_progress_path.exists():
+                skipped_in_progress += 1
+                LOGGER.info("Skipping in-progress session: %s", path)
+                continue
+            if not metadata_path.exists():
+                continue
+
+            try:
+                with open(metadata_path, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+            except Exception as exc:
+                LOGGER.warning("Failed to read session metadata %s: %s", metadata_path, exc)
+                continue
+
+            session_type = metadata.get("session_type")
+            if session_type not in {"single", "batch_remote"}:
+                continue
+            if not completed_path.exists() and not failed_path.exists():
+                continue
+
+            expire_at_value = metadata.get("expire_at")
+            if not expire_at_value:
+                continue
+            expire_at = datetime.fromisoformat(str(expire_at_value).replace("Z", "+00:00"))
+            if expire_at <= now:
+                shutil.rmtree(path, ignore_errors=False)
+                deleted_sessions += 1
+                LOGGER.info("Deleted expired session: %s", path)
+
+    for legacy_file in SINGLE_OUTPUT_DIR.iterdir():
+        if legacy_file.is_dir():
+            continue
+        try:
+            modified_at = datetime.fromtimestamp(legacy_file.stat().st_mtime, tz=timezone.utc)
+        except FileNotFoundError:
+            continue
+        if modified_at + timedelta(days=RETENTION_DAYS) <= now:
+            legacy_file.unlink(missing_ok=True)
+            deleted_legacy_files += 1
+            LOGGER.info("Deleted expired legacy single output: %s", legacy_file)
+
+    LOGGER.info(
+        "Cleanup pass completed: deleted_sessions=%s skipped_in_progress=%s deleted_legacy_files=%s",
+        deleted_sessions,
+        skipped_in_progress,
+        deleted_legacy_files,
+    )
+
+
+
+def cleanup_loop() -> None:
+    while True:
+        try:
+            cleanup_old_outputs()
+        except Exception as exc:
+            LOGGER.exception("Cleanup pass failed: %s", exc)
+        time.sleep(CLEANUP_INTERVAL_SECONDS)
+
+
+
+def start_cleanup_scheduler() -> None:
+    cleanup_old_outputs()
+    cleanup_thread = threading.Thread(target=cleanup_loop, name="output-cleanup", daemon=True)
+    cleanup_thread.start()
+
 
 
 def detect_device() -> tuple[str, torch.dtype]:
@@ -678,7 +863,7 @@ def parse_uploaded_images(files) -> List[Path]:
         return []
     parsed = []
     for file in files:
-        file_path = Path(getattr(file, "name", file))
+        file_path = local_path_from_input(file)
         if file_path.exists():
             parsed.append(file_path)
     return parsed
@@ -746,12 +931,23 @@ def run_generation(
     return result.images[0]
 
 
-def save_single_result(image: Image.Image, image_paths: List[Path], seed: int) -> str:
+def save_single_result(image: Image.Image, session_dir: Path, image_paths: List[Path], seed: int) -> str:
     input_stem = get_primary_input_stem(image_paths)
     file_name = f"{input_stem}_seed{seed}.png"
-    output_path = SINGLE_OUTPUT_DIR / file_name
+    output_path = session_dir / file_name
     image.save(output_path)
     return str(output_path)
+
+
+
+def persist_single_inputs(image_paths: List[Path], session_dir: Path) -> List[Path]:
+    inputs_dir = session_dir / "inputs"
+    persisted_paths = []
+    for index, source_path in enumerate(image_paths, start=1):
+        persisted_name = f"{index:03d}_{source_path.name}"
+        persisted_paths.append(copy_file_to_dir(source_path, inputs_dir, persisted_name))
+    return persisted_paths
+
 
 
 def infer_single(
@@ -766,18 +962,29 @@ def infer_single(
     height,
 ):
     image_paths = parse_uploaded_images(images)
-    result = run_generation(
-        image_paths=image_paths,
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        seed=seed,
-        num_inference_steps=num_inference_steps,
-        guidance_scale=guidance_scale,
-        true_cfg_scale=true_cfg_scale,
-        width=width,
-        height=height,
-    )
-    saved_path = save_single_result(result, image_paths, seed)
+    session_dir = create_session_dir(SINGLE_OUTPUT_DIR, "qwen_image_edit_single")
+    metadata = initialize_session(session_dir, session_type="single")
+    try:
+        persisted_inputs = persist_single_inputs(image_paths, session_dir)
+        metadata["input_files"] = [str(path) for path in persisted_inputs]
+        result = run_generation(
+            image_paths=image_paths,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            true_cfg_scale=true_cfg_scale,
+            width=width,
+            height=height,
+        )
+        saved_path = save_single_result(result, session_dir, image_paths, seed)
+        metadata["result_files"] = [saved_path]
+        finalize_session(session_dir, metadata, status="completed")
+    except Exception:
+        finalize_session(session_dir, metadata, status="failed")
+        raise
+
     resolution_text = "自动" if not width and not height else f"{int(width)} × {int(height)}"
     status = (
         f"推理完成\n\n"
@@ -788,6 +995,7 @@ def infer_single(
         f"- cpu_offload: `{os.getenv('ENABLE_CPU_OFFLOAD', '0')}`\n"
         f"- 输入图片数: {len(image_paths)}\n"
         f"- 输出分辨率: `{resolution_text}`\n"
+        f"- 输出目录: `{session_dir}`\n"
         f"- 输出文件: `{saved_path}`"
     )
     return result, status, saved_path
@@ -797,7 +1005,7 @@ def load_batch_manifest_rows(file_obj) -> tuple[Path, List[dict[str, Any]]]:
     if file_obj is None:
         raise gr.Error("请上传批量任务文件（CSV 或 JSON）。")
 
-    file_path = Path(getattr(file_obj, "name", file_obj)).resolve()
+    file_path = local_path_from_input(file_obj)
     suffix = file_path.suffix.lower()
 
     if suffix == ".csv":
@@ -832,6 +1040,19 @@ def ensure_relative_to_root(path: Path, root: Path) -> None:
         path.relative_to(root)
     except ValueError as exc:
         raise gr.Error(f"上传图片包中的路径越界: {path}") from exc
+
+
+
+def persist_batch_uploads(session_dir: Path, manifest_file, image_package=None) -> tuple[Path, Optional[Path]]:
+    uploads_dir = session_dir / "uploads"
+    manifest_path = local_path_from_input(manifest_file)
+    persisted_manifest = copy_file_to_dir(manifest_path, uploads_dir)
+    persisted_package = None
+    if image_package is not None:
+        package_path = local_path_from_input(image_package)
+        persisted_package = copy_file_to_dir(package_path, uploads_dir)
+    return persisted_manifest, persisted_package
+
 
 
 def resolve_batch_image_path(image_ref: str, manifest_dir: Path, package_root: Optional[Path] = None) -> Path:
@@ -872,7 +1093,7 @@ def prepare_batch_image_package(package_file, session_dir: Path) -> Optional[Pat
     if package_file is None:
         return None
 
-    package_path = Path(getattr(package_file, "name", package_file)).resolve()
+    package_path = local_path_from_input(package_file)
     if package_path.suffix.lower() != ".zip":
         raise gr.Error("图片包仅支持 ZIP 格式。")
 
@@ -952,7 +1173,9 @@ def batch_examples_markdown() -> str:
         "支持两种模式：\n"
         "- **本地模式**：只上传 `CSV/JSON`，`images` 可写绝对路径；相对路径优先按任务文件所在目录解析，再兼容当前项目目录。\n"
         "- **远程上传模式**：上传 `CSV/JSON` + `ZIP` 图片包，`images` 必须写成相对 `ZIP` 根目录的路径。\n"
-        "多图输入在 CSV 中使用 `|` 分隔。远程上传模式建议用 `generate_batch_manifest.py --image-path-mode package-relative` 生成任务文件。\n\n"
+        "多图输入在 CSV 中使用 `|` 分隔。远程上传模式建议用 `generate_batch_manifest.py --image-path-mode package-relative` 生成任务文件。\n"
+        "批量推理界面仅展示总进度，并在全部任务完成后提供一个最终结果 ZIP 下载入口。\n"
+        "单次推理与远程批量上传文件/结果会在服务器暂存 7 天，之后自动清理。\n\n"
         "**CSV 示例**\n"
         f"```csv\n{csv_example}\n```\n"
         "**JSON 示例**\n"
@@ -960,118 +1183,133 @@ def batch_examples_markdown() -> str:
     )
 
 
+def reset_batch_outputs():
+    return "", gr.update(value=None, visible=False)
+
+
+
 def run_batch(manifest_file, image_package=None, progress=gr.Progress(track_tqdm=False)):
     session_dir = Path(tempfile.mkdtemp(prefix="qwen_image_edit_batch_", dir=BATCH_OUTPUT_DIR))
-    package_root = prepare_batch_image_package(image_package, session_dir)
-    items = parse_batch_manifest(manifest_file, package_root=package_root)
-    if not items:
-        raise gr.Error("批量任务文件为空。")
+    session_type = "batch_remote" if image_package is not None else "batch_local"
+    metadata = initialize_session(session_dir, session_type=session_type)
 
-    rows = []
-    gallery = []
+    try:
+        persisted_manifest, persisted_package = persist_batch_uploads(session_dir, manifest_file, image_package)
+        metadata["manifest_file"] = str(persisted_manifest)
+        if persisted_package is not None:
+            metadata["uploaded_package_file"] = str(persisted_package)
 
-    for idx, item in enumerate(items, start=1):
-        progress((idx - 1) / len(items), desc=f"处理中 {idx}/{len(items)}")
-        try:
-            result = run_generation(
-                image_paths=item.image_paths,
-                prompt=item.prompt,
-                negative_prompt=item.negative_prompt,
-                seed=item.seed,
-                num_inference_steps=item.num_inference_steps,
-                guidance_scale=item.guidance_scale,
-                true_cfg_scale=item.true_cfg_scale,
-            )
-            input_stem = get_primary_input_stem(item.image_paths)
-            file_name = f"{idx:03d}_{input_stem}.png"
-            output_path = session_dir / file_name
-            result.save(output_path)
-            rows.append(
-                {
-                    "id": item.row_id,
-                    "prompt": item.prompt,
-                    "negative_prompt": item.negative_prompt,
-                    "images": "|".join(item.image_refs),
-                    "seed": item.seed,
-                    "num_inference_steps": item.num_inference_steps,
-                    "guidance_scale": item.guidance_scale,
-                    "true_cfg_scale": item.true_cfg_scale,
-                    "status": "success",
-                    "output_image": str(output_path),
-                    "error": "",
-                }
-            )
-            gallery.append((str(output_path), f"{item.row_id}: {item.prompt[:60]}"))
-        except Exception as exc:
-            rows.append(
-                {
-                    "id": item.row_id,
-                    "prompt": item.prompt,
-                    "negative_prompt": item.negative_prompt,
-                    "images": "|".join(item.image_refs),
-                    "seed": item.seed,
-                    "num_inference_steps": item.num_inference_steps,
-                    "guidance_scale": item.guidance_scale,
-                    "true_cfg_scale": item.true_cfg_scale,
-                    "status": "failed",
-                    "output_image": "",
-                    "error": str(exc),
-                }
-            )
+        package_root = prepare_batch_image_package(persisted_package, session_dir)
+        if package_root is not None:
+            metadata["extracted_package_dir"] = str(package_root)
 
-    progress(1.0, desc="正在整理结果")
-    csv_path = session_dir / "batch_results.csv"
-    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "id",
-                "prompt",
-                "negative_prompt",
-                "images",
-                "seed",
-                "num_inference_steps",
-                "guidance_scale",
-                "true_cfg_scale",
-                "status",
-                "output_image",
-                "error",
-            ],
+        items = parse_batch_manifest(persisted_manifest, package_root=package_root)
+        if not items:
+            raise gr.Error("批量任务文件为空。")
+
+        rows = []
+        result_files = []
+
+        for idx, item in enumerate(items, start=1):
+            progress((idx - 1) / len(items), desc=f"批量处理中 {idx}/{len(items)}")
+            try:
+                result = run_generation(
+                    image_paths=item.image_paths,
+                    prompt=item.prompt,
+                    negative_prompt=item.negative_prompt,
+                    seed=item.seed,
+                    num_inference_steps=item.num_inference_steps,
+                    guidance_scale=item.guidance_scale,
+                    true_cfg_scale=item.true_cfg_scale,
+                )
+                input_stem = get_primary_input_stem(item.image_paths)
+                file_name = f"{idx:03d}_{input_stem}.png"
+                output_path = session_dir / file_name
+                result.save(output_path)
+                result_files.append(str(output_path))
+                rows.append(
+                    {
+                        "id": item.row_id,
+                        "prompt": item.prompt,
+                        "negative_prompt": item.negative_prompt,
+                        "images": "|".join(item.image_refs),
+                        "seed": item.seed,
+                        "num_inference_steps": item.num_inference_steps,
+                        "guidance_scale": item.guidance_scale,
+                        "true_cfg_scale": item.true_cfg_scale,
+                        "status": "success",
+                        "output_image": str(output_path),
+                        "error": "",
+                    }
+                )
+            except Exception as exc:
+                rows.append(
+                    {
+                        "id": item.row_id,
+                        "prompt": item.prompt,
+                        "negative_prompt": item.negative_prompt,
+                        "images": "|".join(item.image_refs),
+                        "seed": item.seed,
+                        "num_inference_steps": item.num_inference_steps,
+                        "guidance_scale": item.guidance_scale,
+                        "true_cfg_scale": item.true_cfg_scale,
+                        "status": "failed",
+                        "output_image": "",
+                        "error": str(exc),
+                    }
+                )
+
+        progress(1.0, desc="正在整理结果")
+        csv_path = session_dir / "batch_results.csv"
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "id",
+                    "prompt",
+                    "negative_prompt",
+                    "images",
+                    "seed",
+                    "num_inference_steps",
+                    "guidance_scale",
+                    "true_cfg_scale",
+                    "status",
+                    "output_image",
+                    "error",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+
+        json_path = session_dir / "batch_results.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+
+        zip_path = session_dir / "batch_results.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(csv_path, arcname=csv_path.name)
+            zf.write(json_path, arcname=json_path.name)
+            for row in rows:
+                if row["output_image"]:
+                    zf.write(row["output_image"], arcname=Path(row["output_image"]).name)
+
+        success_count = sum(1 for row in rows if row["status"] == "success")
+        metadata["input_files"] = [str(path) for item in items for path in item.image_paths] if session_type == "batch_local" else []
+        metadata["result_files"] = result_files + [str(csv_path), str(json_path), str(zip_path)]
+        finalize_session(session_dir, metadata, status="completed")
+
+        summary = (
+            f"批量推理完成\n\n"
+            f"- 总任务数: {len(rows)}\n"
+            f"- 成功: {success_count}\n"
+            f"- 失败: {len(rows) - success_count}\n"
+            f"- 结果目录: `{session_dir}`\n"
+            f"- 下载文件: `{zip_path}`"
         )
-        writer.writeheader()
-        writer.writerows(rows)
-
-    json_path = session_dir / "batch_results.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(rows, f, ensure_ascii=False, indent=2)
-
-    zip_path = session_dir / "batch_results.zip"
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.write(csv_path, arcname=csv_path.name)
-        zf.write(json_path, arcname=json_path.name)
-        for row in rows:
-            if row["output_image"]:
-                zf.write(row["output_image"], arcname=Path(row["output_image"]).name)
-
-    preview_rows = [
-        [
-            row["id"],
-            row["status"],
-            row["prompt"],
-            row["output_image"],
-            row["error"],
-        ]
-        for row in rows
-    ]
-    success_count = sum(1 for row in rows if row["status"] == "success")
-    summary = (
-        f"批量推理完成\n\n"
-        f"- 总任务数: {len(rows)}\n"
-        f"- 成功: {success_count}\n"
-        f"- 失败: {len(rows) - success_count}\n"
-        f"- 结果目录: `{session_dir}`"
-    )
-    return preview_rows, gallery, summary, str(csv_path), str(json_path), str(zip_path)
+        return summary, gr.update(value=str(zip_path), visible=True)
+    except Exception:
+        finalize_session(session_dir, metadata, status="failed")
+        raise
 
 
 def build_demo() -> gr.Blocks:
@@ -1128,28 +1366,22 @@ def build_demo() -> gr.Blocks:
             batch_image_package = gr.File(label="图片包（ZIP，可选）", file_types=[".zip"])
             batch_button = gr.Button("开始批量推理", variant="primary")
             batch_summary = gr.Markdown()
-            batch_table = gr.Dataframe(
-                headers=["id", "status", "prompt", "output_image", "error"],
-                datatype=["str", "str", "str", "str", "str"],
-                label="批量结果概览",
-                interactive=False,
-                wrap=True,
-            )
-            batch_gallery = gr.Gallery(label="成功结果预览", columns=3, height="auto")
-            with gr.Row():
-                batch_csv = gr.File(label="导出 CSV")
-                batch_json = gr.File(label="导出 JSON")
-                batch_zip = gr.File(label="导出全部结果 ZIP")
+            batch_zip = gr.File(label="下载结果 ZIP", visible=False)
 
             batch_button.click(
+                reset_batch_outputs,
+                outputs=[batch_summary, batch_zip],
+                queue=False,
+            ).then(
                 run_batch,
                 inputs=[batch_manifest, batch_image_package],
-                outputs=[batch_table, batch_gallery, batch_summary, batch_csv, batch_json, batch_zip],
+                outputs=[batch_summary, batch_zip],
             )
 
     return demo
 
 
 if __name__ == "__main__":
+    start_cleanup_scheduler()
     demo = build_demo()
     demo.launch(server_name="0.0.0.0", server_port=7860)

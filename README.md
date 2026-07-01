@@ -1,7 +1,6 @@
 ---
 license: apache-2.0
 language:
-- en
 - zh
 library_name: diffusers
 pipeline_tag: image-to-image
@@ -10,31 +9,38 @@ pipeline_tag: image-to-image
     <img src="https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/qwen_image_edit_logo.png" width="400"/>
 <p>
 <p align="center">
-          💜 <a href="https://chat.qwen.ai/"><b>Qwen Chat</b></a>&nbsp&nbsp | &nbsp&nbsp🤗 <a href="https://huggingface.co/Qwen/Qwen-Image-Edit-2511">Hugging Face</a>&nbsp&nbsp | &nbsp&nbsp🤖 <a href="https://modelscope.cn/models/Qwen/Qwen-Image-Edit-2511">ModelScope</a>&nbsp&nbsp | &nbsp&nbsp 📑 <a href="https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/Qwen_Image.pdf">Tech Report</a> &nbsp&nbsp | &nbsp&nbsp 📑 <a href="https://qwenlm.github.io/blog/qwen-image-edit-2511/">Blog</a> &nbsp&nbsp 
+          💜 <a href="https://chat.qwen.ai/"><b>Qwen Chat</b></a>&nbsp&nbsp | &nbsp&nbsp🤗 <a href="https://huggingface.co/Qwen/Qwen-Image-Edit-2511">Hugging Face</a>&nbsp&nbsp | &nbsp&nbsp🤖 <a href="https://modelscope.cn/models/Qwen/Qwen-Image-Edit-2511">ModelScope</a>&nbsp&nbsp | &nbsp&nbsp 📑 <a href="https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/Qwen_Image.pdf">技术报告</a> &nbsp&nbsp | &nbsp&nbsp 📑 <a href="https://qwenlm.github.io/blog/qwen-image-edit-2511/">博客</a> &nbsp&nbsp 
 <br>
-🖥️ <a href="https://huggingface.co/spaces/Qwen/Qwen-Image-Edit-2511">Demo</a>&nbsp&nbsp | &nbsp&nbsp💬 <a href="https://github.com/QwenLM/Qwen-Image/blob/main/assets/wechat.png">WeChat (微信)</a>&nbsp&nbsp | &nbsp&nbsp🫨 <a href="https://discord.gg/CV4E9rpNSD">Discord</a>&nbsp&nbsp| &nbsp&nbsp <a href="https://github.com/QwenLM/Qwen-Image">Github</a>&nbsp&nbsp
+🖥️ <a href="https://huggingface.co/spaces/Qwen/Qwen-Image-Edit-2511">在线 Demo</a>&nbsp&nbsp | &nbsp&nbsp💬 <a href="https://github.com/QwenLM/Qwen-Image/blob/main/assets/wechat.png">微信</a>&nbsp&nbsp | &nbsp&nbsp🫨 <a href="https://discord.gg/CV4E9rpNSD">Discord</a>&nbsp&nbsp| &nbsp&nbsp <a href="https://github.com/QwenLM/Qwen-Image">Github</a>&nbsp&nbsp
 </p>
 
 <p align="center">
     <img src="https://qianwen-res.oss-accelerate-overseas.aliyuncs.com/Qwen-Image/edit2511/edit2511big.JPG#center" width="1600"/>
 <p>
 
+# 项目简介
 
-# Introduction
+`Qwen-Image-Edit-2511` 是 `Qwen-Image-Edit-2509` 的增强版本，重点提升了图像编辑时的一致性表现，并增强了工业设计生成与几何推理能力。
 
-We are excited to introduce Qwen-Image-Edit-2511, an enhanced version over Qwen-Image-Edit-2509, featuring multiple improvements—including notably better consistency. To try out the latest model, please visit [Qwen Chat](https://chat.qwen.ai/?inputFeature=image_edit) and select the Image Editing feature.
+主要改进包括：
 
-Key enhancements in Qwen-Image-Edit-2511 include: mitigate image drift, improved character consistency，integrated LoRA capabilities， enhanced industrial design generation, and strengthened geometric reasoning ability.
+- 降低编辑过程中的图像漂移
+- 提升人物与角色一致性
+- 集成部分社区常用 LoRA 能力
+- 增强工业设计场景生成效果
+- 增强几何理解与辅助线生成能力
 
+如果你想体验官方在线版本，可以前往 [Qwen Chat](https://chat.qwen.ai/?inputFeature=image_edit) 并选择图像编辑能力。
 
-## Quick Start
+## 快速开始
 
-Install the latest version of diffusers
-```
+### 安装最新版 diffusers
+
+```bash
 pip install git+https://github.com/huggingface/diffusers
 ```
 
-The following contains a code snippet illustrating how to use `Qwen-Image-Edit-2511`:
+### Python 调用示例
 
 ```python
 import os
@@ -42,10 +48,13 @@ import torch
 from PIL import Image
 from diffusers import QwenImageEditPlusPipeline
 
-pipeline = QwenImageEditPlusPipeline.from_pretrained("Qwen/Qwen-Image-Edit-2511", torch_dtype=torch.bfloat16)
+pipeline = QwenImageEditPlusPipeline.from_pretrained(
+    "Qwen/Qwen-Image-Edit-2511",
+    torch_dtype=torch.bfloat16,
+)
 print("pipeline loaded")
 
-pipeline.to('cuda')
+pipeline.to("cuda")
 pipeline.set_progress_bar_config(disable=None)
 image1 = Image.open("input1.png")
 image2 = Image.open("input2.png")
@@ -65,91 +74,124 @@ with torch.inference_mode():
     output_image = output.images[0]
     output_image.save("output_image_edit_2511.png")
     print("image saved at", os.path.abspath("output_image_edit_2511.png"))
-
 ```
 
-## Showcase
+## 能力展示
 
-**Qwen-Image-Edit-2511 Enhances Character Consistency**
-In Qwen-Image-Edit-2511, character consistency has been significantly improved. The model can perform imaginative edits based on an input portrait while preserving the identity and visual characteristics of the subject.
+### 角色一致性增强
+
+`Qwen-Image-Edit-2511` 在人物/角色一致性上有明显提升，可以在保留主体身份特征的前提下完成更具想象力的编辑。
 
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片1.JPG#center)
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片2.JPG#center)
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片3.JPG#center)
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片4.JPG#center)
 
-**Improved Multi-Person Consistency**
-While Qwen-Image-Edit-2509 already improved consistency for single-subject editing, Qwen-Image-Edit-2511 further enhances consistency in multi-person group photos—enabling high-fidelity fusion of two separate person images into a coherent group shot:
+### 多人一致性增强
+
+相比 `2509` 版本对单主体一致性的提升，`2511` 进一步增强了多人场景的一致性表现，适合将两张人物图融合成自然、统一的群像照片。
+
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片5.JPG#center)
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片6.JPG#center)
 
-**Built-in Support for Community-Created LoRAs**
-Since Qwen-Image-Edit’s release, the community has developed many creative and high-quality LoRAs—greatly expanding its expressive potential. Qwen-Image-Edit-2511 integrates selected popular LoRAs directly into the base model, unlocking their effects without extra tuning.
+### 内置社区 LoRA 效果
 
-For example, Lighting Enhancement LoRA
-Realistic lighting control is now achievable out-of-the-box:
+社区已经围绕 Qwen-Image 发展出不少高质量 LoRA。`Qwen-Image-Edit-2511` 将部分常见能力整合进基座模型，无需额外加载即可直接使用。
+
+以光照增强为例：
+
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片7.JPG#center)
-
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片8.JPG#center)
 
-Another example, generating new viewpoints can now be done directly with the base model:
+再如视角变化：
 
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片9.JPG#center)
-
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片10.JPG#center)
 
-**Industrial Design Applications**
+### 工业设计场景
 
-We’ve paid special attention to practical engineering scenarios—for instance, batch industrial product design:
-
+项目也针对工程与设计类场景做了增强，例如批量工业产品设计：
 
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片11.JPG#center)
-
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片12.JPG#center)
 
-…and material replacement for industrial components:
-![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片13.JPG#center)
+以及工业部件材质替换：
 
+![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片13.JPG#center)
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片14.JPG#center)
 
-**Enhanced Geometric Reasoning**
-Qwen-Image-Edit-2511 introduces stronger geometric reasoning capability—e.g., directly generating auxiliary construction lines for design or annotation purposes:
+### 几何推理增强
 
+模型在几何理解方面也更强，例如可以更稳定地生成辅助构造线、标注线等结果：
 
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片15.JPG#center)
-
 ![](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2511/幻灯片16.JPG#center)
-
-That wraps up the major updates in Qwen-Image-Edit-2511.
-Enjoy exploring the new capabilities! 🎉
 
 ## Gradio WebUI
 
-This repository now includes a local Gradio WebUI in `app.py` for both single-image editing and batch inference.
+本仓库提供了本地 `Gradio WebUI`，入口文件为 `app.py`，支持：
 
-### Install
+- 单次图像编辑
+- 多图联合编辑
+- 批量推理
+- 批量结果导出
+
+### 安装依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### Launch
+### 启动方式
 
-Local launch:
+#### 1）单卡启动
+
+适合只有 1 张 GPU，或者只想使用单卡推理：
 
 ```bash
 cd /mnt/data12/luguiliang/Qwen-Image-Edit-2511
-python app.py
+CUDA_VISIBLE_DEVICES=0 python app.py
 ```
 
-Recommended multi-GPU launch:
+#### 2）双卡启动
+
+当前仓库里的 `manual` 设备映射是按 4 卡写死的，因此 **两卡场景推荐使用 `balanced`**：
+
+```bash
+cd /mnt/data12/luguiliang/Qwen-Image-Edit-2511
+CUDA_VISIBLE_DEVICES=0,1 DEVICE_MAP=balanced GPU_MEMORY_RESERVE_GB=1 python app.py
+```
+
+如果两卡显存比较紧张，可以使用更保守的配置：
+
+```bash
+cd /mnt/data12/luguiliang/Qwen-Image-Edit-2511
+CUDA_VISIBLE_DEVICES=0,1 DEVICE_MAP=balanced GPU_MEMORY_RESERVE_GB=2 ENABLE_CPU_OFFLOAD=1 ENABLE_ATTENTION_SLICING=1 python app.py
+```
+
+#### 3）四卡启动（推荐）
+
+4 卡环境下推荐使用仓库内置的手工分片：
 
 ```bash
 cd /mnt/data12/luguiliang/Qwen-Image-Edit-2511
 CUDA_VISIBLE_DEVICES=0,1,2,3 DEVICE_MAP=manual GPU_MEMORY_RESERVE_GB=1 python app.py
 ```
 
-Docker example:
+#### 4）默认启动
+
+如果你不手动设置环境变量，也可以直接启动：
+
+```bash
+cd /mnt/data12/luguiliang/Qwen-Image-Edit-2511
+python app.py
+```
+
+程序会根据当前可见设备自动选择 CPU / CUDA，并在多卡时根据 `DEVICE_MAP` 配置进行分配。
+
+#### 5）Docker 启动示例
+
+启动容器：
 
 ```bash
 docker run -d --name QwenImg \
@@ -163,7 +205,7 @@ docker run -d --name QwenImg \
   torch2.9.1_cu130_py312_ubuntu22.04:latest -f /dev/null
 ```
 
-Start the app inside the container:
+进入容器并启动服务：
 
 ```bash
 docker exec -it QwenImg bash
@@ -171,74 +213,91 @@ cd /app
 CUDA_VISIBLE_DEVICES=0,1,2,3 DEVICE_MAP=manual GPU_MEMORY_RESERVE_GB=1 python app.py
 ```
 
-Then open `http://127.0.0.1:7860` in your browser, or use `http://<server-ip>:7860` from another machine on the same network.
+启动后，在浏览器访问：
 
-### Features
+- 本机：`http://127.0.0.1:7860`
+- 局域网其他机器：`http://<server-ip>:7860`
 
-- Single inference with one or multiple input images
-- Batch inference from a CSV or JSON manifest
-- Result preview in the browser
-- Export batch outputs as `CSV`, `JSON`, or `ZIP`
-- Single inference supports custom output `width` and `height`
-- Automatic multi-GPU sharding with `device_map="balanced"` when CUDA is available
-- VAE slicing/tiling and attention slicing to reduce GPU memory pressure
+### 功能特性
 
-### WebUI Usage
+- 支持单张或多张输入图像编辑
+- 支持基于 `CSV` / `JSON` 的批量推理
+- 批量推理仅展示总进度条，不显示逐文件进度
+- 批量推理完成后提供单一 `ZIP` 下载入口
+- 单次推理支持自定义输出 `width` / `height`
+- 单次推理与远程批量上传文件/结果默认在服务器暂存 7 天
+- 在 CUDA 可用时支持自动多卡分配（`device_map="balanced"`）
+- 支持 VAE slicing / tiling 与 attention slicing，降低显存压力
 
-#### Single Inference
+## WebUI 使用说明
 
-On the `单次推理` tab:
+### 单次推理
 
-1. Upload one or multiple input images.
-2. Enter the edit prompt in `Prompt`.
-3. Optionally fill `Negative Prompt`.
-4. Set inference parameters such as `Seed`, `推理步数`, `guidance_scale`, and `true_cfg_scale`.
-5. Optionally set `输出宽度` and `输出高度`.
-6. Click `开始生成` and wait for the result preview.
+在 `单次推理` 页签中：
 
-Resolution rules:
-- Leave both `输出宽度` and `输出高度` empty: the app automatically chooses a resolution based on the input image aspect ratio.
-- Fill both `输出宽度` and `输出高度`: the app uses the specified output resolution.
-- Fill only one of them: the request is rejected and an error is shown.
+1. 上传一张或多张输入图片。
+2. 在 `Prompt` 中填写编辑指令。
+3. 可选填写 `Negative Prompt`。
+4. 设置 `Seed`、`推理步数`、`guidance_scale`、`true_cfg_scale` 等参数。
+5. 如有需要，可填写 `输出宽度` 和 `输出高度`。
+6. 点击 `开始推理`，等待结果生成。
 
-Notes:
-- Larger resolutions require more GPU memory and are noticeably slower.
-- In manual multi-GPU mode, high resolution plus high step count can significantly increase total runtime.
-- The final internal size may still be aligned to values required by the model implementation.
+分辨率规则：
 
-#### Batch Inference
+- `输出宽度` 和 `输出高度` 都留空：程序会根据输入图像长宽比自动选择分辨率。
+- 两个都填写：按指定分辨率输出。
+- 只填写一个：请求会被拒绝并提示错误。
 
-On the `批量推理` tab:
+说明：
 
-1. Prepare a `CSV` or `JSON` manifest.
-2. Choose one of the following modes:
-   - Local mode: make sure every row/item contains image path(s) readable by the machine running `app.py`, then upload only the manifest.
-   - Remote upload mode: generate a manifest with package-relative image paths, zip the corresponding image folder while preserving its internal structure, then upload both the manifest and the image package.
-3. Upload the manifest file.
-4. Optionally upload the image package `ZIP` if using remote upload mode.
-5. Start batch inference and wait for all tasks to finish.
-6. Review the generated table/gallery and download `CSV`, `JSON`, or `ZIP` outputs if needed.
+- 更大的分辨率会显著增加显存占用和运行时间。
+- 在手工多卡模式下，高分辨率和高步数会进一步拉长总耗时。
+- 实际内部尺寸仍可能按模型要求进行对齐。
 
-Current limitation:
-- Batch inference currently uses the default automatic output resolution logic and does not yet expose per-item `width` / `height` fields in the manifest.
+### 批量推理
 
-#### Batch prompt generation helper
+在 `批量推理` 页签中：
 
-This repository also includes `prompt_generation/generate_batch_manifest.py` for outdoor scene data augmentation. It scans an image folder and generates a JSON manifest directly compatible with the `批量推理` tab in `app.py`.
+1. 准备 `CSV` 或 `JSON` 任务文件。
+2. 选择以下任一模式：
+   - **本地模式**：只上传任务文件，`images` 中填写当前服务端可读取的路径。
+   - **远程上传模式**：先生成相对图片包根目录的任务文件，再把对应图片目录打成 zip，一起上传任务文件和图片包。
+3. 上传任务文件。
+4. 如果使用远程上传模式，再上传图片包 `ZIP`。
+5. 点击开始批量推理。
+6. 等待全部任务执行完成后，下载最终生成的结果 `ZIP`。
 
-Prompt-generation assets are now grouped in `prompt_generation/`:
+说明：
+
+- 批量页只展示一个整体进度条，不展示逐文件推理进度。
+- 批量页完成后只提供一个最终 `ZIP` 下载入口，不再单独展示表格、画廊、CSV、JSON 下载组件。
+- 当前 7 天自动清理规则只覆盖：
+  - 单次推理
+  - 远程上传批量模式（manifest + zip）
+- 本地路径批量模式当前不纳入 7 天自动清理范围。
+
+当前限制：
+
+- 批量模式当前仍使用默认自动分辨率逻辑，不支持在 manifest 中为每条任务单独指定 `width` / `height`。
+
+## 批量任务生成脚本
+
+仓库包含 `prompt_generation/generate_batch_manifest.py`，可用于扫描图像目录并生成可直接喂给 `批量推理` 页签的 JSON 任务文件。
+
+相关文件：
+
 - `prompt_generation/generate_batch_manifest.py`
 - `prompt_generation/prompt_library.yaml`
 
-The script now uses the YAML prompt library in `prompt_generation/prompt_library.yaml` by default.
+脚本默认读取 `prompt_generation/prompt_library.yaml` 作为 prompt 库。
 
-Typical usage:
+### 基础用法
 
 ```bash
 python prompt_generation/generate_batch_manifest.py /path/to/images /path/to/batch_tasks.json --recursive --mode cycle
 ```
 
-Recommended command for the current outdoor augmentation setup:
+### 当前户外增强场景推荐用法
 
 ```bash
 python prompt_generation/generate_batch_manifest.py /path/to/images /path/to/batch_tasks.json \
@@ -254,13 +313,15 @@ python prompt_generation/generate_batch_manifest.py /path/to/images /path/to/bat
   --true-cfg-scale 4.0
 ```
 
-Use a custom YAML prompt library:
+### 使用自定义 YAML Prompt 库
 
 ```bash
 python prompt_generation/generate_batch_manifest.py /path/to/images /path/to/batch_tasks.json --recursive --mode random --library-yaml /path/to/prompt_library.yaml
 ```
 
-Generate a manifest for remote upload mode (`任务文件 + 图片包`) with package-relative image paths:
+### 远程上传模式推荐生成方式
+
+如果你准备在 WebUI 中使用“任务文件 + 图片包”的远程上传模式，建议这样生成：
 
 ```bash
 python prompt_generation/generate_batch_manifest.py /path/to/images /path/to/batch_tasks.json \
@@ -269,7 +330,9 @@ python prompt_generation/generate_batch_manifest.py /path/to/images /path/to/bat
   --image-path-mode package-relative
 ```
 
-Example for images under `/mnt/data12/data_gen`:
+然后把 `/path/to/images` 这个目录整体打成 zip，并保留内部目录结构。
+
+### `/mnt/data12/data_gen` 示例
 
 ```bash
 cd /mnt/data12/luguiliang/Qwen-Image-Edit-2511
@@ -286,7 +349,7 @@ python prompt_generation/generate_batch_manifest.py /mnt/data12/data_gen /mnt/da
   --true-cfg-scale 4.0
 ```
 
-Run the same command inside Docker:
+### Docker 内运行示例
 
 ```bash
 docker exec -it QwenImg bash
@@ -304,13 +367,16 @@ python prompt_generation/generate_batch_manifest.py /mnt/data12/data_gen /mnt/da
   --true-cfg-scale 4.0
 ```
 
-Export the current YAML target library as JSON:
+### 导出当前目标库为 JSON
 
 ```bash
 python prompt_generation/generate_batch_manifest.py --export-targets targets.json
 ```
 
-Current target groups in `prompt_generation/prompt_library.yaml` include:
+### 当前目标类别
+
+`prompt_generation/prompt_library.yaml` 当前包含以下类别：
+
 - `宠物与小动物`
 - `人物与轻度活动`
 - `儿童活动物品`
@@ -318,95 +384,142 @@ Current target groups in `prompt_generation/prompt_library.yaml` include:
 - `庭院设施与居家杂物`
 - `自然杂物与环境干扰`
 
-The script writes a JSON manifest directly compatible with the `批量推理` tab. Each task uses the standard fields `id`, `prompt`, `negative_prompt`, `images`, `seed`, `num_inference_steps`, `guidance_scale`, and `true_cfg_scale`, where `images` is a JSON array. The generated `seed` is now random per task instead of incremental.
+### 脚本输出说明
 
-Notes for prompt generation:
-- `prompt_generation/prompt_library.yaml` controls the prompt template, negative prompt, target library, and `category_ratios`.
-- `--library-yaml` lets you switch to another YAML file without editing Python code.
-- `--image-path-mode absolute` keeps the current local-path behavior.
-- `--image-path-mode package-relative` writes image paths relative to the input image root, which is the recommended mode for remote upload (`任务文件 + 图片包`).
-- When using `package-relative`, create the ZIP from the same input root used to generate the manifest and preserve the internal folder structure.
-- `--category-count-min` and `--category-count-max` control how many times each target entry is randomly repeated in the candidate pool before assignment.
-- `--targets-per-prompt-min` and `--targets-per-prompt-max` control how many targets are combined into one prompt.
-- A single prompt can now mix multiple targets and multiple categories.
-- `category_ratios` controls the global tendency of category sampling across generated tasks.
-- `--prompt-seed` controls target sampling, prompt variation sampling, and random manifest seed generation. Keeping the same value makes the output reproducible; changing it gives a different manifest.
+脚本输出的 JSON manifest 可直接用于 `批量推理`。每条任务包含以下标准字段：
 
-Batch output locations:
-- Single inference images: `outputs/single/`
-- Batch inference session folders: `outputs/batch/`
-- Each batch run creates a new folder such as `outputs/batch/qwen_image_edit_batch_xxxxxxxx/`
-- Generated images, `batch_results.csv`, `batch_results.json`, and `batch_results.zip` are saved in that session folder
+- `id`
+- `prompt`
+- `negative_prompt`
+- `images`
+- `seed`
+- `num_inference_steps`
+- `guidance_scale`
+- `true_cfg_scale`
 
-### Parameter Notes
+其中 `images` 是 JSON 数组，`seed` 现在会为每条任务随机生成，而不是递增编号。
 
-- `Seed`: controls randomness. Using the same seed and the same inputs usually makes results more reproducible.
-- `推理步数` / `num_inference_steps`: more steps usually improve detail and prompt adherence, but runtime grows almost linearly.
-- `guidance_scale`: currently has little practical effect for this app and model path; keeping the default value is recommended.
-- `true_cfg_scale`: stronger prompt conditioning. Larger values may improve prompt adherence, but also increase runtime and sometimes make outputs more aggressive.
-- `Negative Prompt`: optional. In many cases it can be left empty or as a blank string.
+### Prompt 生成参数说明
 
-Practical recommendations:
-- Faster preview: `num_inference_steps=20~24`, `true_cfg_scale=1.0~2.0`
-- Higher quality: `num_inference_steps=32~40`, `true_cfg_scale=3.0~4.0`
-- If runtime is too slow, first reduce resolution and step count.
+- `prompt_generation/prompt_library.yaml` 控制 prompt 模板、negative prompt、目标库和 `category_ratios`。
+- `--library-yaml` 可切换到其他 YAML 库，而无需修改 Python 代码。
+- `--image-path-mode absolute` 保持当前本地路径写法。
+- `--image-path-mode package-relative` 会把图片路径写成相对输入根目录的路径，适合远程上传模式。
+- 当使用 `package-relative` 时，务必从同一个输入根目录打 zip，并保留目录结构。
+- `--category-count-min` 和 `--category-count-max` 控制每个目标在候选池中的重复次数。
+- `--targets-per-prompt-min` 和 `--targets-per-prompt-max` 控制每条 prompt 混合多少个目标。
+- 单条 prompt 现在可以混合多个类别、多个目标。
+- `category_ratios` 控制不同类别在全局采样中的倾向。
+- `--prompt-seed` 同时控制目标采样、prompt 变体采样和输出 seed 生成；固定该值可复现结果，修改该值会得到新的任务文件。
 
-### Multi-GPU Notes
+### 输出目录与 7 天暂存规则
 
-The app automatically spreads the pipeline across all visible GPUs when `torch.cuda.is_available()` is `True`.
+- 单次推理会话目录：`outputs/single/`
+- 批量推理会话目录：`outputs/batch/`
+- 单次推理现在会为每次请求创建独立会话目录，目录中包含：
+  - `inputs/`：上传的原始输入图
+  - 生成结果图
+  - `metadata.json`
+  - 会话状态标记（如 `.completed` / `.failed`）
+- 远程上传批量模式会在批量会话目录中保留：
+  - `uploads/manifest.*`
+  - `uploads/input_package.zip`
+  - `input_package/`：解压后的上传图片
+  - `batch_results.csv`
+  - `batch_results.json`
+  - `batch_results.zip`
+  - `metadata.json`
+  - 会话状态标记
+- 单次推理与远程上传批量模式的上传文件、结果文件默认在服务器暂存 7 天，之后自动清理。
+- 清理任务会跳过仍处于 `.in_progress` 状态的目录，避免删除正在执行中的任务。
+- 本地路径批量模式当前不纳入 7 天自动清理范围。
 
-Optional environment variables:
-- `CUDA_VISIBLE_DEVICES=0,1,2,3`: choose which GPUs are visible
-- `DEVICE_MAP=manual`: multi-GPU sharding strategy, default is the manual map tuned for 4 GPUs
-- `GPU_MEMORY_RESERVE_GB=2`: reserve memory on each GPU before computing `max_memory`
-- `ENABLE_CPU_OFFLOAD=0`: when set to `1`, allow CPU offload as a last resort
-- `CPU_OFFLOAD_MAX_MEMORY=64GiB`: host RAM budget for CPU offload
-- `ENABLE_ATTENTION_SLICING=0`: when set to `1`, reduce memory at the cost of slower inference
+## 参数说明
 
-Manual device map for 4 GPUs:
+- `Seed`：控制随机性。相同输入 + 相同 seed，通常更容易复现相似结果。
+- `推理步数` / `num_inference_steps`：步数越高通常细节和 prompt 服从性越好，但运行时间也会近似线性增加。
+- `guidance_scale`：在当前模型路径下实际影响较小，通常建议保留默认值。
+- `true_cfg_scale`：控制 prompt 约束强度。值越大通常更贴近 prompt，但也可能增加运行时间，并使结果更激进。
+- `Negative Prompt`：可选。很多场景下可以留空或只传空格字符串。
+
+实用建议：
+
+- 快速预览：`num_inference_steps=20~24`，`true_cfg_scale=1.0~2.0`
+- 更高质量：`num_inference_steps=32~40`，`true_cfg_scale=3.0~4.0`
+- 如果运行太慢，优先降低分辨率和步数。
+
+## 多卡与显存说明
+
+只要 `torch.cuda.is_available()` 为 `True`，程序就会尝试在当前可见 GPU 上运行。
+
+### 可选环境变量
+
+- `CUDA_VISIBLE_DEVICES=0,1,2,3`：指定可见 GPU
+- `DEVICE_MAP=manual`：多卡切分策略，当前默认是为 4 卡优化的手工映射
+- `GPU_MEMORY_RESERVE_GB=2`：为每张 GPU 预留的显存大小，用于计算 `max_memory`
+- `ENABLE_CPU_OFFLOAD=0`：设为 `1` 时，允许在必要时使用 CPU offload
+- `CPU_OFFLOAD_MAX_MEMORY=64GiB`：CPU offload 的主机内存预算
+- `ENABLE_ATTENTION_SLICING=0`：设为 `1` 时可进一步节省显存，但速度更慢
+
+### 当前 4 卡手工映射
+
 - `text_encoder -> cuda:1`
 - `vae / processor / scheduler -> cuda:3`
 - `transformer blocks [0:30] -> cuda:0`
 - `transformer blocks [30:60] -> cuda:2`
 
-Note: the pipeline loader in this environment only accepts `device_map` as a string during `from_pretrained()`. Therefore `DEVICE_MAP=manual` is implemented by loading the pipeline normally first, then dispatching major modules and transformer blocks to fixed GPUs in code.
+说明：当前环境中的 pipeline loader 在 `from_pretrained()` 时只接受字符串类型的 `device_map`。因此 `DEVICE_MAP=manual` 的实现方式是：先正常加载 pipeline，再在代码里手工把主要模块和 transformer block 分发到固定 GPU。
 
-If `DEVICE_MAP` is set to something else such as `balanced`, the app falls back to diffusers automatic placement.
+如果 `DEVICE_MAP` 不是 `manual`，例如 `balanced`，程序会回退到 diffusers 自动放置逻辑。
 
-Recommended:
+### 推荐命令
+
+#### 四卡推荐
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 DEVICE_MAP=manual GPU_MEMORY_RESERVE_GB=1 python app.py
 ```
 
-Fallback:
+#### 四卡保守模式
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 DEVICE_MAP=balanced GPU_MEMORY_RESERVE_GB=2 ENABLE_CPU_OFFLOAD=1 ENABLE_ATTENTION_SLICING=1 python app.py
 ```
 
-### Batch Manifest Format
+## 批量任务文件格式
 
-The batch tab accepts either `CSV` or `JSON`.
+批量页支持 `CSV` 和 `JSON` 两种格式。
 
-CSV fields:
-- `id`: optional task id
-- `prompt`: required prompt text
-- `negative_prompt`: optional negative prompt
-- `images`: required image path(s); use `|` to separate multiple image paths
-- `seed`: optional, default `0`
-- `num_inference_steps`: optional, default `40`
-- `guidance_scale`: optional, default `1.0`
-- `true_cfg_scale`: optional, default `4.0`
+### CSV 字段
 
-Notes:
-- The batch tab supports two modes:
-  - Local mode: upload only the manifest. Absolute paths are used directly. Relative paths are resolved against the manifest directory first, then fall back to the project directory for backward compatibility.
-  - Remote upload mode: upload the manifest together with a ZIP image package. In this mode, `images` must use paths relative to the ZIP root.
-- Image paths in the manifest must be readable by the machine running `app.py` after resolution.
-- Batch mode currently does not parse per-item `width` and `height`; it uses the same automatic resolution behavior as single inference with empty width/height.
+- `id`：可选，任务 ID
+- `prompt`：必填，编辑指令
+- `negative_prompt`：可选，负向提示词
+- `images`：必填，图片路径；多图时使用 `|` 分隔
+- `seed`：可选，默认 `0`
+- `num_inference_steps`：可选，默认 `40`
+- `guidance_scale`：可选，默认 `1.0`
+- `true_cfg_scale`：可选，默认 `4.0`
 
-Example CSV:
+### 路径解析规则
+
+批量页支持两种模式：
+
+- **本地模式**：只上传 manifest。
+  - 绝对路径会直接使用。
+  - 相对路径会先按 manifest 所在目录解析。
+  - 若未找到，再回退到当前项目目录，以兼容旧行为。
+- **远程上传模式**：上传 manifest 和 ZIP 图片包。
+  - `images` 必须写成相对 ZIP 根目录的路径。
+  - 服务端会先解压 ZIP，再按相对路径解析图片。
+
+说明：
+
+- 最终解析后的图片路径必须能被运行 `app.py` 的机器读取。
+- 远程上传模式完成后，前端只提供一个最终 `batch_results.zip` 下载入口。
+- 批量模式当前不支持为每条任务单独解析 `width` / `height`，仍沿用单次推理中“留空时自动分辨率”的逻辑。
+
+### CSV 示例
 
 ```csv
 id,prompt,negative_prompt,images,seed,num_inference_steps,guidance_scale,true_cfg_scale
@@ -414,7 +527,7 @@ id,prompt,negative_prompt,images,seed,num_inference_steps,guidance_scale,true_cf
 2,Merge the two people into one travel photo., ,examples/a.png|examples/b.png,42,40,1.0,4.0
 ```
 
-Example JSON:
+### JSON 示例
 
 ```json
 [
@@ -431,13 +544,13 @@ Example JSON:
 ]
 ```
 
-## License Agreement
+## 许可证
 
-Qwen-Image is licensed under Apache 2.0. 
+Qwen-Image 使用 Apache 2.0 许可证。
 
-## Citation
+## 引用
 
-We kindly encourage citation of our work if you find it useful.
+如果本项目对你有帮助，欢迎引用：
 
 ```bibtex
 @misc{wu2025qwenimagetechnicalreport,
@@ -450,6 +563,3 @@ We kindly encourage citation of our work if you find it useful.
       url={https://arxiv.org/abs/2508.02324}, 
 }
 ```
-
-
-CUDA_VISIBLE_DEVICES=0,1,2,3 DEVICE_MAP=manual GPU_MEMORY_RESERVE_GB=1 python app.py
