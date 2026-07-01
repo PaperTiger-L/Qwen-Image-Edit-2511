@@ -303,30 +303,50 @@ def batch_status_payload(session_dir: Path, metadata: dict[str, Any]) -> tuple[s
 
 
 
-def latest_batch_session_dir() -> Optional[Path]:
-    candidate_sessions: list[tuple[float, Path]] = []
-    for path in BATCH_OUTPUT_DIR.iterdir():
-        if not path.is_dir():
-            continue
-        metadata_path, _, _, _ = session_paths(path)
-        if not metadata_path.exists():
-            continue
-        try:
-            metadata = read_session_metadata(path)
-        except Exception:
-            continue
-        if metadata.get("session_type") not in {"batch_remote", "batch_local"}:
-            continue
-        updated_at = str(metadata.get("updated_at") or metadata.get("created_at") or "")
-        try:
-            updated_ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00")).timestamp()
-        except Exception:
-            updated_ts = path.stat().st_mtime
-        candidate_sessions.append((updated_ts, path))
-    if not candidate_sessions:
+def parse_expire_at(metadata: dict[str, Any]) -> Optional[datetime]:
+    expire_at_value = metadata.get("expire_at")
+    if not expire_at_value:
         return None
-    candidate_sessions.sort(key=lambda item: item[0], reverse=True)
-    return candidate_sessions[0][1]
+    try:
+        return datetime.fromisoformat(str(expire_at_value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+
+def is_batch_session_recoverable(session_dir: Path, metadata: dict[str, Any]) -> bool:
+    if metadata.get("session_type") not in {"batch_remote", "batch_local"}:
+        return False
+    expire_at = parse_expire_at(metadata)
+    if expire_at is None or expire_at <= now_utc():
+        return False
+    status = metadata.get("status")
+    if status == BATCH_STATUS_COMPLETED:
+        zip_path = metadata.get("results_zip_file")
+        if not zip_path or not Path(str(zip_path)).exists() or not metadata.get("download_ready"):
+            return False
+    return status in {
+        BATCH_STATUS_PENDING,
+        BATCH_STATUS_RUNNING,
+        BATCH_STATUS_FINALIZING,
+        BATCH_STATUS_COMPLETED,
+        BATCH_STATUS_FAILED,
+    }
+
+
+
+def empty_batch_status_view(batch_mode: str = BATCH_MODE_REMOTE) -> tuple[str, str, Any, str, Any, Any, Any, Any, Any]:
+    return (
+        "",
+        "",
+        gr.update(value=None, visible=False),
+        "",
+        gr.update(active=False),
+        gr.update(interactive=True),
+        gr.update(value=batch_mode),
+        batch_mode_help_text(batch_mode),
+        gr.update(visible=batch_mode == BATCH_MODE_REMOTE, value=None),
+    )
 
 
 
@@ -1455,18 +1475,8 @@ def update_batch_mode_ui(batch_mode: str):
 
 
 
-def reset_batch_outputs():
-    return (
-        "",
-        "",
-        gr.update(value=None, visible=False),
-        "",
-        gr.update(active=False),
-        gr.update(interactive=True),
-        gr.update(),
-        gr.update(),
-        gr.update(),
-    )
+def reset_batch_outputs(batch_mode: str = BATCH_MODE_REMOTE):
+    return empty_batch_status_view(batch_mode=batch_mode)
 
 
 
@@ -1597,43 +1607,34 @@ def execute_batch_session(session_dir: Path, metadata: dict[str, Any], items: li
 
 
 
-def load_batch_session_status(session_id: str) -> tuple[str, str, Any, str, Any, Any, Any, Any, Any]:
+def load_batch_session_status(
+    session_id: str,
+    *,
+    restore_on_load: bool,
+    default_batch_mode: str = BATCH_MODE_REMOTE,
+) -> tuple[str, str, Any, str, Any, Any, Any, Any, Any]:
     if not session_id:
-        return (
-            "",
-            "",
-            gr.update(value=None, visible=False),
-            "",
-            gr.update(active=False),
-            gr.update(interactive=True),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-        )
+        return empty_batch_status_view(batch_mode=default_batch_mode)
+
     session_dir = batch_session_dir_from_id(session_id)
     if not session_dir.exists():
-        return (
-            "### 批量任务状态\n- 状态: 不存在",
-            "批量任务会话不存在，可能已过期或被清理。",
-            gr.update(value=None, visible=False),
-            "",
-            gr.update(active=False),
-            gr.update(interactive=True),
-            gr.update(),
-            gr.update(),
-            gr.update(),
-        )
+        return empty_batch_status_view(batch_mode=default_batch_mode)
 
     metadata = read_session_metadata(session_dir)
+    mode_value = metadata.get("batch_mode") or default_batch_mode
     if metadata.get("status") in {BATCH_STATUS_PENDING, BATCH_STATUS_RUNNING, BATCH_STATUS_FINALIZING} and not is_active_batch_thread(session_id):
         metadata["last_error"] = metadata.get("last_error") or "服务重启或任务线程中断，批量任务未完成。"
         metadata["current_phase"] = "任务中断"
         finalize_session(session_dir, metadata, status=BATCH_STATUS_FAILED)
         metadata = read_session_metadata(session_dir)
 
+    if not is_batch_session_recoverable(session_dir, metadata):
+        return empty_batch_status_view(batch_mode=mode_value)
+
     progress_markdown, summary, zip_path, keep_polling, allow_submit = batch_status_payload(session_dir, metadata)
+    if restore_on_load and metadata.get("status") == BATCH_STATUS_PENDING:
+        progress_markdown = format_batch_progress_markdown(metadata)
     zip_update = gr.update(value=zip_path, visible=bool(zip_path)) if zip_path else gr.update(value=None, visible=False)
-    mode_value = metadata.get("batch_mode") or BATCH_MODE_REMOTE
     return (
         progress_markdown,
         summary,
@@ -1643,21 +1644,18 @@ def load_batch_session_status(session_id: str) -> tuple[str, str, Any, str, Any,
         gr.update(interactive=allow_submit),
         gr.update(value=mode_value),
         batch_mode_help_text(mode_value),
-        gr.update(visible=mode_value == BATCH_MODE_REMOTE),
+        gr.update(visible=mode_value == BATCH_MODE_REMOTE, value=None),
     )
 
 
 
-def poll_batch_status(session_id: str):
-    return load_batch_session_status(session_id)
+def poll_batch_status(session_id: str, batch_mode: str):
+    return load_batch_session_status(session_id, restore_on_load=False, default_batch_mode=batch_mode)
 
 
 
-def restore_latest_batch_session():
-    latest_session = latest_batch_session_dir()
-    if latest_session is None:
-        return load_batch_session_status("")
-    return load_batch_session_status(batch_session_id(latest_session))
+def restore_batch_session_on_load(session_id: str, batch_mode: str):
+    return load_batch_session_status(session_id, restore_on_load=True, default_batch_mode=batch_mode)
 
 
 
@@ -1715,7 +1713,7 @@ def start_batch(manifest_file, batch_mode, image_package=None):
         )
         register_active_batch_thread(session_id, worker)
         worker.start()
-        return load_batch_session_status(session_id)
+        return load_batch_session_status(session_id, restore_on_load=False, default_batch_mode=batch_mode)
     except Exception as exc:
         metadata["last_error"] = str(exc)
         metadata["current_phase"] = "任务初始化失败"
@@ -1773,7 +1771,7 @@ def build_demo() -> gr.Blocks:
 
         with gr.Tab("批量推理"):
             gr.Markdown(batch_examples_markdown())
-            batch_session_state = gr.State("")
+            batch_session_state = gr.BrowserState("")
             batch_poll_timer = gr.Timer(2.0, active=False)
             batch_mode = gr.Radio(
                 choices=[BATCH_MODE_REMOTE, BATCH_MODE_LOCAL],
@@ -1797,6 +1795,7 @@ def build_demo() -> gr.Blocks:
 
             batch_button.click(
                 reset_batch_outputs,
+                inputs=[batch_mode],
                 outputs=[
                     batch_progress,
                     batch_summary,
@@ -1827,7 +1826,7 @@ def build_demo() -> gr.Blocks:
 
             batch_poll_timer.tick(
                 poll_batch_status,
-                inputs=[batch_session_state],
+                inputs=[batch_session_state, batch_mode],
                 outputs=[
                     batch_progress,
                     batch_summary,
@@ -1842,7 +1841,8 @@ def build_demo() -> gr.Blocks:
             )
 
             demo.load(
-                restore_latest_batch_session,
+                restore_batch_session_on_load,
+                inputs=[batch_session_state, batch_mode],
                 outputs=[
                     batch_progress,
                     batch_summary,
