@@ -8,7 +8,9 @@ import yaml
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 PROMPT_GENERATION_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = PROMPT_GENERATION_DIR.parent
 DEFAULT_LIBRARY_PATH = PROMPT_GENERATION_DIR / "prompt_library.yaml"
+DEFAULT_LOCAL_BATCH_ROOT = PROJECT_ROOT / "batch_inputs"
 
 
 def validate_category_ratios(
@@ -212,11 +214,19 @@ def select_targets(
 
 
 
-def serialize_image_path(image_path: Path, input_root: Path, path_mode: str) -> str:
+def serialize_image_path(image_path: Path, input_root: Path, path_mode: str, local_batch_root: Path) -> str:
     if path_mode == "absolute":
         return str(image_path)
     if path_mode == "package-relative":
         return image_path.relative_to(input_root).as_posix()
+    if path_mode == "project-relative":
+        try:
+            return image_path.relative_to(local_batch_root).as_posix()
+        except ValueError as exc:
+            raise SystemExit(
+                "project-relative 模式要求输入图片目录位于本地批处理根目录下: "
+                f"{local_batch_root}"
+            ) from exc
     raise SystemExit(f"Unsupported image path mode: {path_mode}")
 
 
@@ -238,6 +248,7 @@ def to_output_rows(
     max_targets_per_prompt: int,
     input_root: Path,
     image_path_mode: str,
+    local_batch_root: Path,
 ) -> List[dict]:
     rng = random.Random(prompt_seed)
     ratio_weighted_targets = build_ratio_weighted_targets(targets, category_ratios)
@@ -266,7 +277,14 @@ def to_output_rows(
                 "id": str(index),
                 "prompt": prompt,
                 "negative_prompt": negative_prompt,
-                "images": [serialize_image_path(image_path, input_root=input_root, path_mode=image_path_mode)],
+                "images": [
+                    serialize_image_path(
+                        image_path,
+                        input_root=input_root,
+                        path_mode=image_path_mode,
+                        local_batch_root=local_batch_root,
+                    )
+                ],
                 "seed": rng.randint(0, 2**31 - 1),
                 "num_inference_steps": num_inference_steps,
                 "guidance_scale": guidance_scale,
@@ -303,7 +321,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--category-count-max", type=int, default=1, help="Maximum repeat count for each target/category when building the target pool.")
     parser.add_argument("--targets-per-prompt-min", type=int, default=2, help="Minimum number of targets combined into one prompt.")
     parser.add_argument("--targets-per-prompt-max", type=int, default=4, help="Maximum number of targets combined into one prompt.")
-    parser.add_argument("--image-path-mode", choices=["absolute", "package-relative"], default="absolute", help="How to write image paths into the manifest.")
+    parser.add_argument(
+        "--image-path-mode",
+        choices=["project-relative", "package-relative", "absolute"],
+        default="project-relative",
+        help="How to write image paths into the manifest.",
+    )
+    parser.add_argument(
+        "--local-batch-root",
+        type=Path,
+        default=DEFAULT_LOCAL_BATCH_ROOT,
+        help="Project-local batch image root used by project-relative mode.",
+    )
     parser.add_argument("--library-yaml", type=Path, default=DEFAULT_LIBRARY_PATH, help="Path to prompt library YAML file.")
     parser.add_argument("--export-targets", type=Path, help="Export the loaded target library as JSON and exit.")
     return parser.parse_args()
@@ -332,6 +361,8 @@ def main() -> None:
     if not input_dir.exists() or not input_dir.is_dir():
         raise SystemExit(f"Input directory does not exist or is not a folder: {input_dir}")
 
+    local_batch_root = args.local_batch_root.resolve()
+
     image_paths = list(iter_images(input_dir, recursive=args.recursive))
     if not image_paths:
         raise SystemExit(f"No images found in: {input_dir}")
@@ -353,6 +384,7 @@ def main() -> None:
         max_targets_per_prompt=args.targets_per_prompt_max,
         input_root=input_dir,
         image_path_mode=args.image_path_mode,
+        local_batch_root=local_batch_root,
     )
     output_path = args.output_json.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -361,6 +393,8 @@ def main() -> None:
     print(f"Generated {len(rows)} tasks -> {output_path}")
     print(f"Target mode: {args.mode}")
     print(f"Image path mode: {args.image_path_mode}")
+    if args.image_path_mode == "project-relative":
+        print(f"Local batch root: {local_batch_root}")
     print(f"Prompt library: {library_yaml}")
     print(f"Target library size: {len(target_library)}")
     if category_ratios:

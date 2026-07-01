@@ -259,8 +259,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 DEVICE_MAP=manual GPU_MEMORY_RESERVE_GB=1 python ap
 在 `批量推理` 页签中：
 
 1. 准备 `CSV` 或 `JSON` 任务文件。
-2. 选择以下任一模式：
-   - **本地模式**：只上传任务文件，`images` 中填写当前服务端可读取的路径。
+2. 在页面中选择以下任一模式：
+   - **服务端本地图片模式**：先把图片目录手动放到项目根目录下的 `batch_inputs/` 中，再上传任务文件。
    - **远程上传模式**：先生成相对图片包根目录的任务文件，再把对应图片目录打成 zip，一起上传任务文件和图片包。
 3. 上传任务文件。
 4. 如果使用远程上传模式，再上传图片包 `ZIP`。
@@ -271,10 +271,13 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 DEVICE_MAP=manual GPU_MEMORY_RESERVE_GB=1 python ap
 
 - 批量页只展示一个整体进度条，不展示逐文件推理进度。
 - 批量页完成后只提供一个最终 `ZIP` 下载入口，不再单独展示表格、画廊、CSV、JSON 下载组件。
+- 页面会根据所选模式切换输入项：
+  - 服务端本地图片模式：只需要上传任务文件
+  - 远程上传模式：需要同时上传任务文件和图片包 `ZIP`
 - 当前 7 天自动清理规则只覆盖：
   - 单次推理
   - 远程上传批量模式（manifest + zip）
-- 本地路径批量模式当前不纳入 7 天自动清理范围。
+- 服务端本地图片模式当前不纳入 7 天自动清理范围。
 
 当前限制：
 
@@ -318,6 +321,19 @@ python prompt_generation/generate_batch_manifest.py /path/to/images /path/to/bat
 ```bash
 python prompt_generation/generate_batch_manifest.py /path/to/images /path/to/batch_tasks.json --recursive --mode random --library-yaml /path/to/prompt_library.yaml
 ```
+
+### 服务端本地图片模式推荐生成方式
+
+如果你准备在 WebUI 中使用“服务端本地图片模式”，建议先把图片目录放到项目根目录下的 `batch_inputs/` 中，再生成任务文件：
+
+```bash
+python prompt_generation/generate_batch_manifest.py ./batch_inputs/task_001 /path/to/batch_tasks.json \
+  --recursive \
+  --mode random \
+  --image-path-mode project-relative
+```
+
+此时任务文件中的 `images` 会写成相对 `batch_inputs/` 的路径，例如 `task_001/a.jpg`。
 
 ### 远程上传模式推荐生成方式
 
@@ -403,8 +419,10 @@ python prompt_generation/generate_batch_manifest.py --export-targets targets.jso
 
 - `prompt_generation/prompt_library.yaml` 控制 prompt 模板、negative prompt、目标库和 `category_ratios`。
 - `--library-yaml` 可切换到其他 YAML 库，而无需修改 Python 代码。
-- `--image-path-mode absolute` 保持当前本地路径写法。
+- `--image-path-mode project-relative` 会把图片路径写成相对项目根目录 `batch_inputs/` 的路径，适合服务端本地图片模式。
 - `--image-path-mode package-relative` 会把图片路径写成相对输入根目录的路径，适合远程上传模式。
+- `--local-batch-root` 用于指定 `project-relative` 模式对应的项目内图片根目录，默认是仓库根目录下的 `batch_inputs/`。
+- `--image-path-mode absolute` 仅建议用于兼容旧任务文件，不再推荐作为新流程默认方式。
 - 当使用 `package-relative` 时，务必从同一个输入根目录打 zip，并保留目录结构。
 - `--category-count-min` 和 `--category-count-max` 控制每个目标在候选池中的重复次数。
 - `--targets-per-prompt-min` 和 `--targets-per-prompt-max` 控制每条 prompt 混合多少个目标。
@@ -432,7 +450,7 @@ python prompt_generation/generate_batch_manifest.py --export-targets targets.jso
   - 会话状态标记
 - 单次推理与远程上传批量模式的上传文件、结果文件默认在服务器暂存 7 天，之后自动清理。
 - 清理任务会跳过仍处于 `.in_progress` 状态的目录，避免删除正在执行中的任务。
-- 本地路径批量模式当前不纳入 7 天自动清理范围。
+- 服务端本地图片模式当前不纳入 7 天自动清理范围。
 
 ## 参数说明
 
@@ -505,17 +523,18 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 DEVICE_MAP=balanced GPU_MEMORY_RESERVE_GB=2 ENABLE_
 
 批量页支持两种模式：
 
-- **本地模式**：只上传 manifest。
-  - 绝对路径会直接使用。
-  - 相对路径会先按 manifest 所在目录解析。
-  - 若未找到，再回退到当前项目目录，以兼容旧行为。
+- **服务端本地图片模式**：只上传 manifest。
+  - 图片必须先放到项目根目录下的 `batch_inputs/` 中。
+  - `images` 只能写文件名或相对 `batch_inputs/` 的路径。
+  - 不支持绝对路径，也不支持 `..` 越界路径。
 - **远程上传模式**：上传 manifest 和 ZIP 图片包。
   - `images` 必须写成相对 ZIP 根目录的路径。
-  - 服务端会先解压 ZIP，再按相对路径解析图片。
+  - 服务端会先把 manifest、ZIP 落到会话目录，再解压 ZIP 并按相对路径解析图片。
+  - 不支持绝对路径，也不支持 `..` 越界路径。
 
 说明：
 
-- 最终解析后的图片路径必须能被运行 `app.py` 的机器读取。
+- 最终解析后的图片路径必须位于项目目录控制范围内。
 - 远程上传模式完成后，前端只提供一个最终 `batch_results.zip` 下载入口。
 - 批量模式当前不支持为每条任务单独解析 `width` / `height`，仍沿用单次推理中“留空时自动分辨率”的逻辑。
 

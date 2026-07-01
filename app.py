@@ -12,7 +12,7 @@ import uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, List, Optional
 
 import gradio as gr
@@ -34,6 +34,7 @@ MODEL_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = MODEL_DIR / "outputs"
 BATCH_OUTPUT_DIR = OUTPUT_DIR / "batch"
 SINGLE_OUTPUT_DIR = OUTPUT_DIR / "single"
+LOCAL_BATCH_INPUT_DIR = MODEL_DIR / "batch_inputs"
 RETENTION_DAYS = int(os.getenv("OUTPUT_RETENTION_DAYS", "7"))
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", str(6 * 60 * 60)))
 METADATA_FILENAME = "metadata.json"
@@ -44,8 +45,11 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 OUTPUT_DIR.mkdir(exist_ok=True)
 BATCH_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SINGLE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_BATCH_INPUT_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 LOGGER = logging.getLogger(__name__)
+BATCH_MODE_REMOTE = "远程上传模式（manifest + ZIP）"
+BATCH_MODE_LOCAL = "服务端本地图片模式"
 
 _PIPELINE: Optional[QwenImageEditPlusPipeline] = None
 _DEVICE: Optional[str] = None
@@ -1055,38 +1059,55 @@ def persist_batch_uploads(session_dir: Path, manifest_file, image_package=None) 
 
 
 
-def resolve_batch_image_path(image_ref: str, manifest_dir: Path, package_root: Optional[Path] = None) -> Path:
+def looks_like_absolute_image_ref(image_ref: str) -> bool:
+    path = Path(image_ref)
+    windows_path = PureWindowsPath(image_ref)
+    return path.is_absolute() or windows_path.is_absolute() or bool(windows_path.drive)
+
+
+
+def normalize_relative_image_ref(image_ref: str, mode_label: str) -> PurePosixPath:
+    normalized_ref = PurePosixPath(image_ref)
+    if normalized_ref.is_absolute() or ".." in normalized_ref.parts:
+        raise gr.Error(f"{mode_label}不允许越界路径: {image_ref}")
+    return normalized_ref
+
+
+
+def resolve_batch_image_path(
+    image_ref: str,
+    batch_mode: str,
+    manifest_dir: Path,
+    package_root: Optional[Path] = None,
+    local_batch_root: Path = LOCAL_BATCH_INPUT_DIR,
+) -> Path:
     image_ref = image_ref.strip()
     if not image_ref:
         raise gr.Error("批量任务中的 images 字段不能为空。")
 
-    ref_path = Path(image_ref)
-    if package_root is not None:
-        if ref_path.is_absolute():
+    if looks_like_absolute_image_ref(image_ref):
+        if batch_mode == BATCH_MODE_REMOTE:
             raise gr.Error(
-                "检测到已上传图片包，但任务文件中的 images 使用了绝对路径。"
+                "远程上传模式下，任务文件中的 images 不能使用绝对路径。"
                 "请使用 generate_batch_manifest.py 的 --image-path-mode package-relative 重新生成任务文件。"
             )
-        normalized_ref = PurePosixPath(image_ref)
-        if normalized_ref.is_absolute() or ".." in normalized_ref.parts:
-            raise gr.Error(f"图片包模式下不允许越界路径: {image_ref}")
+        raise gr.Error(
+            "服务端本地图片模式下，任务文件中的 images 不能使用绝对路径。"
+            f"请先把图片放到项目目录 `{LOCAL_BATCH_INPUT_DIR.name}/` 下，再使用文件名或相对路径。"
+        )
+
+    if batch_mode == BATCH_MODE_REMOTE:
+        if package_root is None:
+            raise gr.Error("远程上传模式必须上传图片包 ZIP。")
+        normalized_ref = normalize_relative_image_ref(image_ref, "远程上传模式")
         resolved_path = (package_root / Path(*normalized_ref.parts)).resolve()
         ensure_relative_to_root(resolved_path, package_root)
         return resolved_path
 
-    candidate_paths = []
-    if ref_path.is_absolute():
-        candidate_paths.append(ref_path)
-    else:
-        candidate_paths.append((manifest_dir / ref_path).resolve())
-        fallback_path = (MODEL_DIR / ref_path).resolve()
-        if fallback_path not in candidate_paths:
-            candidate_paths.append(fallback_path)
-
-    for candidate_path in candidate_paths:
-        if candidate_path.exists():
-            return candidate_path
-    return candidate_paths[0]
+    normalized_ref = normalize_relative_image_ref(image_ref, "服务端本地图片模式")
+    resolved_path = (local_batch_root / Path(*normalized_ref.parts)).resolve()
+    ensure_relative_to_root(resolved_path, local_batch_root.resolve())
+    return resolved_path
 
 
 def prepare_batch_image_package(package_file, session_dir: Path) -> Optional[Path]:
@@ -1122,7 +1143,12 @@ def prepare_batch_image_package(package_file, session_dir: Path) -> Optional[Pat
     return package_root
 
 
-def parse_batch_manifest(file_obj, package_root: Optional[Path] = None) -> List[BatchItem]:
+def parse_batch_manifest(
+    file_obj,
+    batch_mode: str,
+    package_root: Optional[Path] = None,
+    local_batch_root: Path = LOCAL_BATCH_INPUT_DIR,
+) -> List[BatchItem]:
     manifest_path, rows = load_batch_manifest_rows(file_obj)
     manifest_dir = manifest_path.parent
 
@@ -1132,7 +1158,16 @@ def parse_batch_manifest(file_obj, package_root: Optional[Path] = None) -> List[
         prompt = str(row.get("prompt") or "").strip()
         negative_prompt = str(row.get("negative_prompt") or " ")
         image_refs = parse_row_image_refs(row)
-        image_paths = [resolve_batch_image_path(image_ref, manifest_dir, package_root=package_root) for image_ref in image_refs]
+        image_paths = [
+            resolve_batch_image_path(
+                image_ref,
+                batch_mode=batch_mode,
+                manifest_dir=manifest_dir,
+                package_root=package_root,
+                local_batch_root=local_batch_root,
+            )
+            for image_ref in image_refs
+        ]
         for image_ref, path in zip(image_refs, image_paths):
             if not path.exists():
                 raise gr.Error(f"批量任务 {row_id} 的图片不存在: {image_ref}")
@@ -1154,14 +1189,14 @@ def parse_batch_manifest(file_obj, package_root: Optional[Path] = None) -> List[
 
 def batch_examples_markdown() -> str:
     csv_example = """id,prompt,negative_prompt,images,seed,num_inference_steps,guidance_scale,true_cfg_scale
-1,A silver robot standing in a flower field., ,examples/input1.png,0,40,1.0,4.0
-2,Merge the two people into one travel photo., ,examples/a.png|examples/b.png,42,40,1.0,4.0"""
+1,A silver robot standing in a flower field., ,task_001/input1.png,0,40,1.0,4.0
+2,Merge the two people into one travel photo., ,task_001/a.png|task_001/b.png,42,40,1.0,4.0"""
     json_example = [
         {
             "id": "1",
             "prompt": "A silver robot standing in a flower field.",
             "negative_prompt": " ",
-            "images": ["examples/input1.png"],
+            "images": ["task_001/input1.png"],
             "seed": 0,
             "num_inference_steps": 40,
             "guidance_scale": 1.0,
@@ -1171,9 +1206,9 @@ def batch_examples_markdown() -> str:
     return (
         "### 批量任务文件格式\n"
         "支持两种模式：\n"
-        "- **本地模式**：只上传 `CSV/JSON`，`images` 可写绝对路径；相对路径优先按任务文件所在目录解析，再兼容当前项目目录。\n"
-        "- **远程上传模式**：上传 `CSV/JSON` + `ZIP` 图片包，`images` 必须写成相对 `ZIP` 根目录的路径。\n"
-        "多图输入在 CSV 中使用 `|` 分隔。远程上传模式建议用 `generate_batch_manifest.py --image-path-mode package-relative` 生成任务文件。\n"
+        f"- **{BATCH_MODE_LOCAL}**：先把图片放到项目目录 `{LOCAL_BATCH_INPUT_DIR.name}/` 下，`images` 只写文件名或相对该目录的路径。\n"
+        f"- **{BATCH_MODE_REMOTE}**：上传 `CSV/JSON` + `ZIP` 图片包，`images` 必须写成相对 `ZIP` 根目录的路径。\n"
+        "多图输入在 CSV 中使用 `|` 分隔。远程上传模式建议用 `generate_batch_manifest.py --image-path-mode package-relative` 生成任务文件；服务端本地图片模式建议用 `--image-path-mode project-relative`。\n"
         "批量推理界面仅展示总进度，并在全部任务完成后提供一个最终结果 ZIP 下载入口。\n"
         "单次推理与远程批量上传文件/结果会在服务器暂存 7 天，之后自动清理。\n\n"
         "**CSV 示例**\n"
@@ -1183,15 +1218,47 @@ def batch_examples_markdown() -> str:
     )
 
 
+
+def batch_mode_help_text(batch_mode: str) -> str:
+    if batch_mode == BATCH_MODE_REMOTE:
+        return (
+            "**当前模式：远程上传**\n\n"
+            "- 上传 `manifest + ZIP`。\n"
+            "- `images` 必须写成 ZIP 内相对路径。\n"
+            "- 服务端会先把 manifest 和 ZIP 保存到本次会话目录，再从解压目录读取图片。"
+        )
+    return (
+        "**当前模式：服务端本地图片**\n\n"
+        f"- 请先把图片手动放到项目目录 `{LOCAL_BATCH_INPUT_DIR.name}/` 下。\n"
+        "- `images` 只能写文件名或相对该目录的路径。\n"
+        "- 不支持绝对路径，也不支持项目目录之外的图片路径。"
+    )
+
+
+
+def update_batch_mode_ui(batch_mode: str):
+    is_remote = batch_mode == BATCH_MODE_REMOTE
+    return batch_mode_help_text(batch_mode), gr.update(visible=is_remote, value=None)
+
+
+
 def reset_batch_outputs():
     return "", gr.update(value=None, visible=False)
 
 
 
-def run_batch(manifest_file, image_package=None, progress=gr.Progress(track_tqdm=False)):
+def run_batch(manifest_file, batch_mode, image_package=None, progress=gr.Progress(track_tqdm=False)):
+    if manifest_file is None:
+        raise gr.Error("请先上传批量任务文件。")
+    if batch_mode not in {BATCH_MODE_REMOTE, BATCH_MODE_LOCAL}:
+        raise gr.Error("请选择批量推理模式。")
+    if batch_mode == BATCH_MODE_REMOTE and image_package is None:
+        raise gr.Error("远程上传模式必须同时上传图片包 ZIP。")
+
     session_dir = Path(tempfile.mkdtemp(prefix="qwen_image_edit_batch_", dir=BATCH_OUTPUT_DIR))
-    session_type = "batch_remote" if image_package is not None else "batch_local"
+    session_type = "batch_remote" if batch_mode == BATCH_MODE_REMOTE else "batch_local"
     metadata = initialize_session(session_dir, session_type=session_type)
+    metadata["batch_mode"] = batch_mode
 
     try:
         persisted_manifest, persisted_package = persist_batch_uploads(session_dir, manifest_file, image_package)
@@ -1203,7 +1270,12 @@ def run_batch(manifest_file, image_package=None, progress=gr.Progress(track_tqdm
         if package_root is not None:
             metadata["extracted_package_dir"] = str(package_root)
 
-        items = parse_batch_manifest(persisted_manifest, package_root=package_root)
+        items = parse_batch_manifest(
+            persisted_manifest,
+            batch_mode=batch_mode,
+            package_root=package_root,
+            local_batch_root=LOCAL_BATCH_INPUT_DIR,
+        )
         if not items:
             raise gr.Error("批量任务文件为空。")
 
@@ -1362,11 +1434,24 @@ def build_demo() -> gr.Blocks:
 
         with gr.Tab("批量推理"):
             gr.Markdown(batch_examples_markdown())
+            batch_mode = gr.Radio(
+                choices=[BATCH_MODE_REMOTE, BATCH_MODE_LOCAL],
+                value=BATCH_MODE_REMOTE,
+                label="批量推理模式",
+            )
+            batch_mode_help = gr.Markdown(batch_mode_help_text(BATCH_MODE_REMOTE))
             batch_manifest = gr.File(label="批量任务文件（CSV/JSON）", file_types=[".csv", ".json"])
-            batch_image_package = gr.File(label="图片包（ZIP，可选）", file_types=[".zip"])
+            batch_image_package = gr.File(label="图片包（ZIP）", file_types=[".zip"], visible=True)
             batch_button = gr.Button("开始批量推理", variant="primary")
             batch_summary = gr.Markdown()
             batch_zip = gr.File(label="下载结果 ZIP", visible=False)
+
+            batch_mode.change(
+                update_batch_mode_ui,
+                inputs=[batch_mode],
+                outputs=[batch_mode_help, batch_image_package],
+                queue=False,
+            )
 
             batch_button.click(
                 reset_batch_outputs,
@@ -1374,7 +1459,7 @@ def build_demo() -> gr.Blocks:
                 queue=False,
             ).then(
                 run_batch,
-                inputs=[batch_manifest, batch_image_package],
+                inputs=[batch_manifest, batch_mode, batch_image_package],
                 outputs=[batch_summary, batch_zip],
             )
 
