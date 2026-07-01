@@ -5,7 +5,6 @@ import logging
 import os
 import shutil
 import stat
-import tempfile
 import threading
 import time
 import uuid
@@ -50,6 +49,14 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 LOGGER = logging.getLogger(__name__)
 BATCH_MODE_REMOTE = "远程上传模式（manifest + ZIP）"
 BATCH_MODE_LOCAL = "服务端本地图片模式"
+BATCH_STATUS_PENDING = "pending"
+BATCH_STATUS_RUNNING = "running"
+BATCH_STATUS_FINALIZING = "finalizing"
+BATCH_STATUS_COMPLETED = "completed"
+BATCH_STATUS_FAILED = "failed"
+PARTIAL_RESULTS_FILENAME = "batch_results.partial.json"
+ACTIVE_BATCH_THREADS: dict[str, threading.Thread] = {}
+ACTIVE_BATCH_THREADS_LOCK = threading.Lock()
 
 _PIPELINE: Optional[QwenImageEditPlusPipeline] = None
 _DEVICE: Optional[str] = None
@@ -102,8 +109,36 @@ def create_session_dir(root_dir: Path, prefix: str) -> Path:
 
 def write_session_metadata(session_dir: Path, metadata: dict[str, Any]) -> None:
     metadata_path, _, _, _ = session_paths(session_dir)
-    with open(metadata_path, "w", encoding="utf-8") as f:
+    metadata = dict(metadata)
+    metadata["updated_at"] = isoformat_utc(now_utc())
+    temp_path = metadata_path.with_suffix(".tmp")
+    with open(temp_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
+    temp_path.replace(metadata_path)
+
+
+
+def read_session_metadata(session_dir: Path) -> dict[str, Any]:
+    metadata_path, _, _, _ = session_paths(session_dir)
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+
+def batch_session_id(session_dir: Path) -> str:
+    return session_dir.name
+
+
+
+def batch_session_dir_from_id(session_id: str) -> Path:
+    session_id = (session_id or "").strip()
+    if not session_id:
+        raise gr.Error("批量任务会话 ID 不能为空。")
+    if "/" in session_id or "\\" in session_id or session_id in {".", ".."}:
+        raise gr.Error("无效的批量任务会话 ID。")
+    session_dir = (BATCH_OUTPUT_DIR / session_id).resolve()
+    ensure_relative_to_root(session_dir, BATCH_OUTPUT_DIR.resolve())
+    return session_dir
 
 
 
@@ -112,8 +147,10 @@ def initialize_session(session_dir: Path, session_type: str, retention_days: int
     expire_at = created_at + timedelta(days=retention_days)
     metadata = {
         "session_type": session_type,
-        "status": "in_progress",
+        "status": "in_progress" if session_type == "single" else BATCH_STATUS_PENDING,
         "created_at": isoformat_utc(created_at),
+        "updated_at": isoformat_utc(created_at),
+        "started_at": None,
         "finished_at": None,
         "expire_at": isoformat_utc(expire_at),
         "input_files": [],
@@ -121,6 +158,20 @@ def initialize_session(session_dir: Path, session_type: str, retention_days: int
         "manifest_file": None,
         "uploaded_package_file": None,
         "extracted_package_dir": None,
+        "batch_mode": None,
+        "total_items": 0,
+        "completed_items": 0,
+        "success_items": 0,
+        "failed_items": 0,
+        "current_index": 0,
+        "current_row_id": None,
+        "current_phase": None,
+        "progress": 0.0,
+        "results_json_file": None,
+        "results_csv_file": None,
+        "results_zip_file": None,
+        "download_ready": False,
+        "last_error": None,
     }
     metadata_path, in_progress_path, completed_path, failed_path = session_paths(session_dir)
     completed_path.unlink(missing_ok=True)
@@ -134,10 +185,11 @@ def initialize_session(session_dir: Path, session_type: str, retention_days: int
 def finalize_session(session_dir: Path, metadata: dict[str, Any], status: str) -> None:
     metadata["status"] = status
     metadata["finished_at"] = isoformat_utc(now_utc())
+    metadata["current_phase"] = "done" if status == BATCH_STATUS_COMPLETED else metadata.get("current_phase")
     write_session_metadata(session_dir, metadata)
     _, in_progress_path, completed_path, failed_path = session_paths(session_dir)
     in_progress_path.unlink(missing_ok=True)
-    if status == "completed":
+    if status in {"completed", BATCH_STATUS_COMPLETED}:
         completed_path.touch()
         failed_path.unlink(missing_ok=True)
     else:
@@ -158,6 +210,123 @@ def local_path_from_input(file_obj) -> Path:
     if isinstance(file_obj, Path):
         return file_obj.resolve()
     return Path(getattr(file_obj, "name", file_obj)).resolve()
+
+
+
+def write_partial_batch_results(session_dir: Path, rows: list[dict[str, Any]]) -> Path:
+    partial_path = session_dir / PARTIAL_RESULTS_FILENAME
+    with open(partial_path, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+    return partial_path
+
+
+
+def load_partial_batch_results(session_dir: Path) -> list[dict[str, Any]]:
+    partial_path = session_dir / PARTIAL_RESULTS_FILENAME
+    if not partial_path.exists():
+        return []
+    with open(partial_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, list) else []
+
+
+
+def format_batch_progress_markdown(metadata: dict[str, Any]) -> str:
+    status = metadata.get("status") or BATCH_STATUS_PENDING
+    total_items = int(metadata.get("total_items") or 0)
+    completed_items = int(metadata.get("completed_items") or 0)
+    success_items = int(metadata.get("success_items") or 0)
+    failed_items = int(metadata.get("failed_items") or 0)
+    current_index = int(metadata.get("current_index") or 0)
+    current_row_id = metadata.get("current_row_id") or "-"
+    progress_value = float(metadata.get("progress") or 0.0)
+    progress_percent = max(0.0, min(progress_value, 1.0)) * 100
+    phase = metadata.get("current_phase") or "等待中"
+
+    status_label_map = {
+        BATCH_STATUS_PENDING: "等待启动",
+        BATCH_STATUS_RUNNING: "正在处理",
+        BATCH_STATUS_FINALIZING: "正在整理结果",
+        BATCH_STATUS_COMPLETED: "已完成",
+        BATCH_STATUS_FAILED: "已失败",
+    }
+    status_label = status_label_map.get(status, str(status))
+    current_line = f"- 当前任务: {current_index}/{total_items}" if total_items else "- 当前任务: 0/0"
+    if status in {BATCH_STATUS_COMPLETED, BATCH_STATUS_FAILED} and total_items:
+        current_line = f"- 已处理: {completed_items}/{total_items}"
+
+    return (
+        "### 批量任务状态\n"
+        f"- 状态: {status_label}\n"
+        f"- 阶段: {phase}\n"
+        f"- 进度: {progress_percent:.1f}%\n"
+        f"{current_line}\n"
+        f"- 当前条目 ID: {current_row_id}\n"
+        f"- 成功: {success_items}\n"
+        f"- 失败: {failed_items}"
+    )
+
+
+
+def format_batch_summary(metadata: dict[str, Any], session_dir: Path) -> str:
+    total_items = int(metadata.get("total_items") or 0)
+    success_items = int(metadata.get("success_items") or 0)
+    failed_items = int(metadata.get("failed_items") or 0)
+    results_zip = metadata.get("results_zip_file")
+    summary = (
+        "批量推理完成\n\n"
+        f"- 总任务数: {total_items}\n"
+        f"- 成功: {success_items}\n"
+        f"- 失败: {failed_items}\n"
+        f"- 结果目录: `{session_dir}`"
+    )
+    if results_zip:
+        summary += f"\n- 下载文件: `{results_zip}`"
+    return summary
+
+
+
+def batch_status_payload(session_dir: Path, metadata: dict[str, Any]) -> tuple[str, str, Optional[str], bool, bool]:
+    status = metadata.get("status")
+    progress_markdown = format_batch_progress_markdown(metadata)
+    summary = ""
+    zip_path = None
+    keep_polling = status in {BATCH_STATUS_PENDING, BATCH_STATUS_RUNNING, BATCH_STATUS_FINALIZING}
+    allow_submit = not keep_polling
+    if status == BATCH_STATUS_COMPLETED:
+        summary = format_batch_summary(metadata, session_dir)
+        zip_path = metadata.get("results_zip_file")
+    elif status == BATCH_STATUS_FAILED:
+        error_text = metadata.get("last_error") or "批量任务执行失败。"
+        summary = f"批量推理失败\n\n- 任务目录: `{session_dir}`\n- 错误: {error_text}"
+    return progress_markdown, summary, zip_path, keep_polling, allow_submit
+
+
+
+def latest_batch_session_dir() -> Optional[Path]:
+    candidate_sessions: list[tuple[float, Path]] = []
+    for path in BATCH_OUTPUT_DIR.iterdir():
+        if not path.is_dir():
+            continue
+        metadata_path, _, _, _ = session_paths(path)
+        if not metadata_path.exists():
+            continue
+        try:
+            metadata = read_session_metadata(path)
+        except Exception:
+            continue
+        if metadata.get("session_type") not in {"batch_remote", "batch_local"}:
+            continue
+        updated_at = str(metadata.get("updated_at") or metadata.get("created_at") or "")
+        try:
+            updated_ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            updated_ts = path.stat().st_mtime
+        candidate_sessions.append((updated_ts, path))
+    if not candidate_sessions:
+        return None
+    candidate_sessions.sort(key=lambda item: item[0], reverse=True)
+    return candidate_sessions[0][1]
 
 
 
@@ -234,7 +403,51 @@ def cleanup_loop() -> None:
 
 
 
+def register_active_batch_thread(session_id: str, worker: threading.Thread) -> None:
+    with ACTIVE_BATCH_THREADS_LOCK:
+        ACTIVE_BATCH_THREADS[session_id] = worker
+
+
+
+def unregister_active_batch_thread(session_id: str) -> None:
+    with ACTIVE_BATCH_THREADS_LOCK:
+        ACTIVE_BATCH_THREADS.pop(session_id, None)
+
+
+
+def is_active_batch_thread(session_id: str) -> bool:
+    with ACTIVE_BATCH_THREADS_LOCK:
+        worker = ACTIVE_BATCH_THREADS.get(session_id)
+    return worker is not None and worker.is_alive()
+
+
+
+def reconcile_in_progress_batch_sessions() -> None:
+    for session_dir in BATCH_OUTPUT_DIR.iterdir():
+        if not session_dir.is_dir():
+            continue
+        metadata_path, in_progress_path, _, _ = session_paths(session_dir)
+        if not metadata_path.exists() or not in_progress_path.exists():
+            continue
+        try:
+            metadata = read_session_metadata(session_dir)
+        except Exception as exc:
+            LOGGER.warning("Failed to read batch session metadata during reconcile %s: %s", session_dir, exc)
+            continue
+        if metadata.get("session_type") not in {"batch_remote", "batch_local"}:
+            continue
+        if is_active_batch_thread(batch_session_id(session_dir)):
+            continue
+        metadata["status"] = BATCH_STATUS_FAILED
+        metadata["current_phase"] = "任务中断"
+        metadata["last_error"] = metadata.get("last_error") or "服务重启或任务线程中断，批量任务未完成。"
+        finalize_session(session_dir, metadata, status=BATCH_STATUS_FAILED)
+        LOGGER.info("Marked orphaned batch session as failed: %s", session_dir)
+
+
+
 def start_cleanup_scheduler() -> None:
+    reconcile_in_progress_batch_sessions()
     cleanup_old_outputs()
     cleanup_thread = threading.Thread(target=cleanup_loop, name="output-cleanup", daemon=True)
     cleanup_thread.start()
@@ -1243,47 +1456,35 @@ def update_batch_mode_ui(batch_mode: str):
 
 
 def reset_batch_outputs():
-    return "", gr.update(value=None, visible=False)
+    return (
+        "",
+        "",
+        gr.update(value=None, visible=False),
+        "",
+        gr.update(active=False),
+        gr.update(interactive=True),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+    )
 
 
 
-def run_batch(manifest_file, batch_mode, image_package=None, progress=gr.Progress(track_tqdm=False)):
-    if manifest_file is None:
-        raise gr.Error("请先上传批量任务文件。")
-    if batch_mode not in {BATCH_MODE_REMOTE, BATCH_MODE_LOCAL}:
-        raise gr.Error("请选择批量推理模式。")
-    if batch_mode == BATCH_MODE_REMOTE and image_package is None:
-        raise gr.Error("远程上传模式必须同时上传图片包 ZIP。")
-
-    session_dir = Path(tempfile.mkdtemp(prefix="qwen_image_edit_batch_", dir=BATCH_OUTPUT_DIR))
-    session_type = "batch_remote" if batch_mode == BATCH_MODE_REMOTE else "batch_local"
-    metadata = initialize_session(session_dir, session_type=session_type)
-    metadata["batch_mode"] = batch_mode
-
+def execute_batch_session(session_dir: Path, metadata: dict[str, Any], items: list[BatchItem]) -> None:
+    session_id = batch_session_id(session_dir)
+    rows: list[dict[str, Any]] = []
+    result_files: list[str] = []
     try:
-        persisted_manifest, persisted_package = persist_batch_uploads(session_dir, manifest_file, image_package)
-        metadata["manifest_file"] = str(persisted_manifest)
-        if persisted_package is not None:
-            metadata["uploaded_package_file"] = str(persisted_package)
-
-        package_root = prepare_batch_image_package(persisted_package, session_dir)
-        if package_root is not None:
-            metadata["extracted_package_dir"] = str(package_root)
-
-        items = parse_batch_manifest(
-            persisted_manifest,
-            batch_mode=batch_mode,
-            package_root=package_root,
-            local_batch_root=LOCAL_BATCH_INPUT_DIR,
-        )
-        if not items:
-            raise gr.Error("批量任务文件为空。")
-
-        rows = []
-        result_files = []
+        metadata["status"] = BATCH_STATUS_RUNNING
+        metadata["started_at"] = isoformat_utc(now_utc())
+        metadata["current_phase"] = "正在处理"
+        write_session_metadata(session_dir, metadata)
 
         for idx, item in enumerate(items, start=1):
-            progress((idx - 1) / len(items), desc=f"批量处理中 {idx}/{len(items)}")
+            metadata["current_index"] = idx
+            metadata["current_row_id"] = item.row_id
+            metadata["current_phase"] = f"批量处理中 {idx}/{len(items)}"
+            write_session_metadata(session_dir, metadata)
             try:
                 result = run_generation(
                     image_paths=item.image_paths,
@@ -1314,6 +1515,7 @@ def run_batch(manifest_file, batch_mode, image_package=None, progress=gr.Progres
                         "error": "",
                     }
                 )
+                metadata["success_items"] = int(metadata.get("success_items") or 0) + 1
             except Exception as exc:
                 rows.append(
                     {
@@ -1330,8 +1532,18 @@ def run_batch(manifest_file, batch_mode, image_package=None, progress=gr.Progres
                         "error": str(exc),
                     }
                 )
+                metadata["failed_items"] = int(metadata.get("failed_items") or 0) + 1
 
-        progress(1.0, desc="正在整理结果")
+            metadata["completed_items"] = idx
+            metadata["progress"] = idx / len(items)
+            write_partial_batch_results(session_dir, rows)
+            write_session_metadata(session_dir, metadata)
+
+        metadata["status"] = BATCH_STATUS_FINALIZING
+        metadata["current_phase"] = "正在整理结果"
+        metadata["current_row_id"] = None
+        write_session_metadata(session_dir, metadata)
+
         csv_path = session_dir / "batch_results.csv"
         with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(
@@ -1365,22 +1577,149 @@ def run_batch(manifest_file, batch_mode, image_package=None, progress=gr.Progres
                 if row["output_image"]:
                     zf.write(row["output_image"], arcname=Path(row["output_image"]).name)
 
-        success_count = sum(1 for row in rows if row["status"] == "success")
-        metadata["input_files"] = [str(path) for item in items for path in item.image_paths] if session_type == "batch_local" else []
+        metadata["progress"] = 1.0
+        metadata["current_index"] = len(items)
+        metadata["current_phase"] = "处理完成"
+        metadata["results_csv_file"] = str(csv_path)
+        metadata["results_json_file"] = str(json_path)
+        metadata["results_zip_file"] = str(zip_path)
+        metadata["download_ready"] = True
+        metadata["input_files"] = [str(path) for item in items for path in item.image_paths]
         metadata["result_files"] = result_files + [str(csv_path), str(json_path), str(zip_path)]
-        finalize_session(session_dir, metadata, status="completed")
+        finalize_session(session_dir, metadata, status=BATCH_STATUS_COMPLETED)
+    except Exception as exc:
+        metadata["last_error"] = str(exc)
+        metadata["current_phase"] = "任务失败"
+        finalize_session(session_dir, metadata, status=BATCH_STATUS_FAILED)
+        LOGGER.exception("Batch session failed: %s", session_dir)
+    finally:
+        unregister_active_batch_thread(session_id)
 
-        summary = (
-            f"批量推理完成\n\n"
-            f"- 总任务数: {len(rows)}\n"
-            f"- 成功: {success_count}\n"
-            f"- 失败: {len(rows) - success_count}\n"
-            f"- 结果目录: `{session_dir}`\n"
-            f"- 下载文件: `{zip_path}`"
+
+
+def load_batch_session_status(session_id: str) -> tuple[str, str, Any, str, Any, Any, Any, Any, Any]:
+    if not session_id:
+        return (
+            "",
+            "",
+            gr.update(value=None, visible=False),
+            "",
+            gr.update(active=False),
+            gr.update(interactive=True),
+            gr.update(),
+            gr.update(),
+            gr.update(),
         )
-        return summary, gr.update(value=str(zip_path), visible=True)
-    except Exception:
-        finalize_session(session_dir, metadata, status="failed")
+    session_dir = batch_session_dir_from_id(session_id)
+    if not session_dir.exists():
+        return (
+            "### 批量任务状态\n- 状态: 不存在",
+            "批量任务会话不存在，可能已过期或被清理。",
+            gr.update(value=None, visible=False),
+            "",
+            gr.update(active=False),
+            gr.update(interactive=True),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+        )
+
+    metadata = read_session_metadata(session_dir)
+    if metadata.get("status") in {BATCH_STATUS_PENDING, BATCH_STATUS_RUNNING, BATCH_STATUS_FINALIZING} and not is_active_batch_thread(session_id):
+        metadata["last_error"] = metadata.get("last_error") or "服务重启或任务线程中断，批量任务未完成。"
+        metadata["current_phase"] = "任务中断"
+        finalize_session(session_dir, metadata, status=BATCH_STATUS_FAILED)
+        metadata = read_session_metadata(session_dir)
+
+    progress_markdown, summary, zip_path, keep_polling, allow_submit = batch_status_payload(session_dir, metadata)
+    zip_update = gr.update(value=zip_path, visible=bool(zip_path)) if zip_path else gr.update(value=None, visible=False)
+    mode_value = metadata.get("batch_mode") or BATCH_MODE_REMOTE
+    return (
+        progress_markdown,
+        summary,
+        zip_update,
+        session_id,
+        gr.update(active=keep_polling),
+        gr.update(interactive=allow_submit),
+        gr.update(value=mode_value),
+        batch_mode_help_text(mode_value),
+        gr.update(visible=mode_value == BATCH_MODE_REMOTE),
+    )
+
+
+
+def poll_batch_status(session_id: str):
+    return load_batch_session_status(session_id)
+
+
+
+def restore_latest_batch_session():
+    latest_session = latest_batch_session_dir()
+    if latest_session is None:
+        return load_batch_session_status("")
+    return load_batch_session_status(batch_session_id(latest_session))
+
+
+
+def start_batch(manifest_file, batch_mode, image_package=None):
+    if manifest_file is None:
+        raise gr.Error("请先上传批量任务文件。")
+    if batch_mode not in {BATCH_MODE_REMOTE, BATCH_MODE_LOCAL}:
+        raise gr.Error("请选择批量推理模式。")
+    if batch_mode == BATCH_MODE_REMOTE and image_package is None:
+        raise gr.Error("远程上传模式必须同时上传图片包 ZIP。")
+
+    session_dir = create_session_dir(BATCH_OUTPUT_DIR, "qwen_image_edit_batch")
+    session_id = batch_session_id(session_dir)
+    session_type = "batch_remote" if batch_mode == BATCH_MODE_REMOTE else "batch_local"
+    metadata = initialize_session(session_dir, session_type=session_type)
+    metadata["batch_mode"] = batch_mode
+
+    try:
+        persisted_manifest, persisted_package = persist_batch_uploads(session_dir, manifest_file, image_package)
+        metadata["manifest_file"] = str(persisted_manifest)
+        if persisted_package is not None:
+            metadata["uploaded_package_file"] = str(persisted_package)
+
+        package_root = prepare_batch_image_package(persisted_package, session_dir)
+        if package_root is not None:
+            metadata["extracted_package_dir"] = str(package_root)
+
+        items = parse_batch_manifest(
+            persisted_manifest,
+            batch_mode=batch_mode,
+            package_root=package_root,
+            local_batch_root=LOCAL_BATCH_INPUT_DIR,
+        )
+        if not items:
+            raise gr.Error("批量任务文件为空。")
+
+        metadata["total_items"] = len(items)
+        metadata["completed_items"] = 0
+        metadata["success_items"] = 0
+        metadata["failed_items"] = 0
+        metadata["current_index"] = 0
+        metadata["current_row_id"] = None
+        metadata["current_phase"] = "等待后台任务启动"
+        metadata["progress"] = 0.0
+        metadata["download_ready"] = False
+        metadata["last_error"] = None
+        write_partial_batch_results(session_dir, [])
+        write_session_metadata(session_dir, metadata)
+
+        worker = threading.Thread(
+            target=execute_batch_session,
+            args=(session_dir, metadata, items),
+            name=f"batch-worker-{session_id}",
+            daemon=True,
+        )
+        register_active_batch_thread(session_id, worker)
+        worker.start()
+        return load_batch_session_status(session_id)
+    except Exception as exc:
+        metadata["last_error"] = str(exc)
+        metadata["current_phase"] = "任务初始化失败"
+        finalize_session(session_dir, metadata, status=BATCH_STATUS_FAILED)
         raise
 
 
@@ -1434,6 +1773,8 @@ def build_demo() -> gr.Blocks:
 
         with gr.Tab("批量推理"):
             gr.Markdown(batch_examples_markdown())
+            batch_session_state = gr.State("")
+            batch_poll_timer = gr.Timer(2.0, active=False)
             batch_mode = gr.Radio(
                 choices=[BATCH_MODE_REMOTE, BATCH_MODE_LOCAL],
                 value=BATCH_MODE_REMOTE,
@@ -1443,6 +1784,7 @@ def build_demo() -> gr.Blocks:
             batch_manifest = gr.File(label="批量任务文件（CSV/JSON）", file_types=[".csv", ".json"])
             batch_image_package = gr.File(label="图片包（ZIP）", file_types=[".zip"], visible=True)
             batch_button = gr.Button("开始批量推理", variant="primary")
+            batch_progress = gr.Markdown()
             batch_summary = gr.Markdown()
             batch_zip = gr.File(label="下载结果 ZIP", visible=False)
 
@@ -1455,12 +1797,63 @@ def build_demo() -> gr.Blocks:
 
             batch_button.click(
                 reset_batch_outputs,
-                outputs=[batch_summary, batch_zip],
+                outputs=[
+                    batch_progress,
+                    batch_summary,
+                    batch_zip,
+                    batch_session_state,
+                    batch_poll_timer,
+                    batch_button,
+                    batch_mode,
+                    batch_mode_help,
+                    batch_image_package,
+                ],
                 queue=False,
             ).then(
-                run_batch,
+                start_batch,
                 inputs=[batch_manifest, batch_mode, batch_image_package],
-                outputs=[batch_summary, batch_zip],
+                outputs=[
+                    batch_progress,
+                    batch_summary,
+                    batch_zip,
+                    batch_session_state,
+                    batch_poll_timer,
+                    batch_button,
+                    batch_mode,
+                    batch_mode_help,
+                    batch_image_package,
+                ],
+            )
+
+            batch_poll_timer.tick(
+                poll_batch_status,
+                inputs=[batch_session_state],
+                outputs=[
+                    batch_progress,
+                    batch_summary,
+                    batch_zip,
+                    batch_session_state,
+                    batch_poll_timer,
+                    batch_button,
+                    batch_mode,
+                    batch_mode_help,
+                    batch_image_package,
+                ],
+            )
+
+            demo.load(
+                restore_latest_batch_session,
+                outputs=[
+                    batch_progress,
+                    batch_summary,
+                    batch_zip,
+                    batch_session_state,
+                    batch_poll_timer,
+                    batch_button,
+                    batch_mode,
+                    batch_mode_help,
+                    batch_image_package,
+                ],
             )
 
     return demo
