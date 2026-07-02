@@ -131,6 +131,17 @@ def isoformat_utc(value: datetime) -> str:
     return value.isoformat().replace("+00:00", "Z")
 
 
+DISPLAY_TIMEZONE = timezone(timedelta(hours=8))
+
+
+
+def format_display_time(value: Optional[str]) -> str:
+    parsed = task_store.parse_utc(value)
+    if parsed is None:
+        return ""
+    return parsed.astimezone(DISPLAY_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+
+
 
 def session_paths(session_dir: Path) -> tuple[Path, Path, Path, Path]:
     return (
@@ -1833,8 +1844,8 @@ def format_jobs_table(jobs: list[dict[str, Any]]) -> list[list[Any]]:
                 job.get("job_type"),
                 job.get("status"),
                 f"{float(job.get('progress') or 0.0) * 100:.1f}%",
-                job.get("created_at"),
-                job.get("finished_at") or "",
+                format_display_time(job.get("created_at")),
+                format_display_time(job.get("finished_at")),
                 "可下载" if job.get("status") == task_store.JOB_STATUS_COMPLETED and job.get("download_ready") else "不可下载",
             ]
         )
@@ -1907,8 +1918,8 @@ def admin_refresh_users(request: gr.Request) -> list[list[Any]]:
             user["username"],
             user["role"],
             "启用" if user["is_active"] else "禁用",
-            user["created_at"],
-            user.get("last_login_at") or "",
+            format_display_time(user["created_at"]),
+            format_display_time(user.get("last_login_at")),
         ]
         for user in task_store.list_users()
     ]
