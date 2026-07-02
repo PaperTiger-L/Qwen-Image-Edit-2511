@@ -2048,6 +2048,7 @@ def build_demo() -> gr.Blocks:
                 inputs=[batch_mode],
                 outputs=[batch_mode_help, batch_image_package],
                 queue=False,
+                show_progress="hidden",
             )
 
             batch_button.click(
@@ -2065,6 +2066,7 @@ def build_demo() -> gr.Blocks:
                     batch_image_package,
                 ],
                 queue=False,
+                show_progress="hidden",
             ).then(
                 start_batch,
                 inputs=[batch_manifest, batch_mode, batch_image_package],
@@ -2095,6 +2097,8 @@ def build_demo() -> gr.Blocks:
                     batch_mode_help,
                     batch_image_package,
                 ],
+                queue=False,
+                show_progress="hidden",
             )
 
             demo.load(
@@ -2111,6 +2115,8 @@ def build_demo() -> gr.Blocks:
                     batch_mode_help,
                     batch_image_package,
                 ],
+                queue=False,
+                show_progress="hidden",
             )
 
         with gr.Tab("我的任务"):
@@ -2124,9 +2130,9 @@ def build_demo() -> gr.Blocks:
             job_detail_button = gr.Button("查看任务详情")
             job_detail = gr.Markdown()
             job_download = gr.File(label="下载结果", visible=False)
-            refresh_jobs_button.click(refresh_my_jobs, outputs=[jobs_table])
-            job_detail_button.click(load_job_detail, inputs=[job_id_input], outputs=[job_detail, job_download])
-            demo.load(refresh_my_jobs, outputs=[jobs_table])
+            refresh_jobs_button.click(refresh_my_jobs, outputs=[jobs_table], queue=False, show_progress="hidden")
+            job_detail_button.click(load_job_detail, inputs=[job_id_input], outputs=[job_detail, job_download], queue=False, show_progress="hidden")
+            demo.load(refresh_my_jobs, outputs=[jobs_table], queue=False, show_progress="hidden")
 
         with gr.Tab("管理员面板"):
             with gr.Group(visible=False) as admin_panel:
@@ -2145,20 +2151,24 @@ def build_demo() -> gr.Blocks:
                 disable_username = gr.Textbox(label="要删除/禁用的用户名")
                 admin_disable_button = gr.Button("删除/禁用用户")
                 admin_message = gr.Markdown()
-                admin_refresh_button.click(admin_refresh_users, outputs=[admin_users_table])
+                admin_refresh_button.click(admin_refresh_users, outputs=[admin_users_table], queue=False, show_progress="hidden")
                 admin_create_button.click(
                     admin_create_user,
                     inputs=[new_username, new_password, new_role],
                     outputs=[admin_message, admin_users_table],
+                    queue=False,
+                    show_progress="hidden",
                 )
                 admin_disable_button.click(
                     admin_disable_user,
                     inputs=[disable_username],
                     outputs=[admin_message, admin_users_table],
+                    queue=False,
+                    show_progress="hidden",
                 )
-                demo.load(admin_refresh_users, outputs=[admin_users_table])
+                demo.load(admin_refresh_users, outputs=[admin_users_table], queue=False, show_progress="hidden")
 
-        demo.load(load_user_context, outputs=[user_status, admin_panel])
+        demo.load(load_user_context, outputs=[user_status, admin_panel], queue=False, show_progress="hidden")
 
     return demo
 
