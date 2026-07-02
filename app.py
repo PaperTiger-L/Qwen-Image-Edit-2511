@@ -1983,7 +1983,9 @@ def build_demo() -> gr.Blocks:
             "# Qwen-Image-Edit-2511 Gradio WebUI\n"
             "支持多用户登录、单次推理、多图编辑、批量任务推理和任务记录管理。"
         )
-        user_status = gr.Markdown()
+        with gr.Row():
+            user_status = gr.Markdown()
+            gr.HTML('<a href="/logout" style="display:inline-block;padding:8px 12px;border:1px solid #ddd;border-radius:6px;text-decoration:none;">退出登录</a>')
 
         with gr.Tab("单次推理"):
             with gr.Row():
