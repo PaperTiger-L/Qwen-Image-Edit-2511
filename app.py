@@ -1797,6 +1797,30 @@ def restore_batch_session_on_load(session_id: str, batch_mode: str, request: gr.
 
 
 
+def job_related_paths(job: dict[str, Any]) -> list[Path]:
+    paths = [Path(job["session_dir"])]
+    for key in ("manifest_file", "uploaded_package_file", "extracted_package_dir"):
+        value = job.get(key)
+        if not value:
+            continue
+        path = Path(value)
+        if path.name in {"uploads", "input_package"}:
+            paths.extend([path, path.parent])
+        else:
+            paths.extend([path.parent, path.parent.parent])
+    return sorted(set(paths), key=lambda item: len(str(item)), reverse=True)
+
+
+def delete_job_files(job: dict[str, Any]) -> None:
+    for path in job_related_paths(job):
+        if not path.exists():
+            continue
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+
 def format_jobs_table(jobs: list[dict[str, Any]]) -> list[list[Any]]:
     rows = []
     for job in jobs:
@@ -1884,6 +1908,27 @@ def admin_disable_user(username: str, request: gr.Request) -> tuple[str, list[li
     task_store.set_user_active(user["id"], False)
     task_store.audit(admin["id"], "disable_user", "user", user["id"], {"username": username})
     return f"用户 `{username}` 已禁用。", admin_refresh_users(request)
+
+
+def admin_refresh_jobs(request: gr.Request) -> list[list[Any]]:
+    admin = current_admin(request)
+    return format_jobs_table(task_store.list_jobs_for_user(admin, limit=500))
+
+
+def admin_delete_job(job_id: str, request: gr.Request) -> tuple[str, list[list[Any]]]:
+    admin = current_admin(request)
+    job_id = (job_id or "").strip()
+    if not job_id:
+        raise gr.Error("请输入要删除的任务 ID。")
+    job = task_store.get_job(job_id)
+    if not job:
+        raise gr.Error("任务不存在。")
+    if job.get("status") in {task_store.JOB_STATUS_RUNNING, task_store.JOB_STATUS_FINALIZING, task_store.JOB_STATUS_QUEUED} and is_active_batch_thread(job_id):
+        raise gr.Error("任务仍在运行中，不能删除。")
+    delete_job_files(job)
+    task_store.mark_job_deleted(job_id)
+    task_store.audit(admin["id"], "delete_job", "job", job_id, {"owner": job.get("user_id"), "session_dir": job.get("session_dir")})
+    return f"任务 `{job_id}` 已删除。", admin_refresh_jobs(request)
 
 
 def load_user_context(request: gr.Request) -> tuple[str, Any]:
@@ -1990,10 +2035,25 @@ def start_batch(manifest_file, batch_mode, image_package=None, request: gr.Reque
         raise
 
 
+APP_CSS = """
+.login-container,
+#login-form,
+.gradio-container > .wrap > .panel {
+    margin: auto !important;
+}
+.login-container {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+"""
+
+
 def build_demo() -> gr.Blocks:
-    with gr.Blocks(title="Qwen-Image-Edit-2511 WebUI") as demo:
+    with gr.Blocks(title="Image-to-Image", css=APP_CSS) as demo:
         gr.Markdown(
-            "# Qwen-Image-Edit-2511 Gradio WebUI\n"
+            "# Image-to-Image\n"
             "支持多用户登录、单次推理、多图编辑、批量任务推理和任务记录管理。"
         )
         user_status = gr.HTML()
@@ -2180,6 +2240,26 @@ def build_demo() -> gr.Blocks:
                 show_progress="hidden",
             )
             demo.load(admin_refresh_users, outputs=[admin_users_table], queue=False, show_progress="hidden")
+
+            gr.Markdown("### 任务管理")
+            admin_refresh_jobs_button = gr.Button("刷新全部任务")
+            admin_jobs_table = gr.Dataframe(
+                headers=["任务ID", "用户", "类型", "状态", "进度", "创建时间", "完成时间", "下载"],
+                datatype=["str", "str", "str", "str", "str", "str", "str", "str"],
+                interactive=False,
+            )
+            admin_delete_job_id = gr.Textbox(label="要删除的任务 ID")
+            admin_delete_job_button = gr.Button("删除任务及服务器文件", variant="stop")
+            admin_job_message = gr.Markdown()
+            admin_refresh_jobs_button.click(admin_refresh_jobs, outputs=[admin_jobs_table], queue=False, show_progress="hidden")
+            admin_delete_job_button.click(
+                admin_delete_job,
+                inputs=[admin_delete_job_id],
+                outputs=[admin_job_message, admin_jobs_table],
+                queue=False,
+                show_progress="hidden",
+            )
+            demo.load(admin_refresh_jobs, outputs=[admin_jobs_table], queue=False, show_progress="hidden")
 
         demo.load(load_user_context, outputs=[user_status, admin_panel], queue=False, show_progress="hidden")
 
