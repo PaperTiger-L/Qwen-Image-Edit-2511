@@ -1883,7 +1883,11 @@ def admin_disable_user(username: str, request: gr.Request) -> tuple[str, list[li
 
 def load_user_context(request: gr.Request) -> tuple[str, Any]:
     user = current_user(request)
-    return f"当前用户：`{user['username']}`（{user['role']}）", gr.update(visible=user.get("role") == task_store.ROLE_ADMIN)
+    return (
+        f"当前用户：`{user['username']}`（{user['role']}） "
+        "[退出登录](/logout)",
+        gr.update(visible=user.get("role") == task_store.ROLE_ADMIN),
+    )
 
 
 def start_batch(manifest_file, batch_mode, image_package=None, request: gr.Request = None):
@@ -1983,9 +1987,7 @@ def build_demo() -> gr.Blocks:
             "# Qwen-Image-Edit-2511 Gradio WebUI\n"
             "支持多用户登录、单次推理、多图编辑、批量任务推理和任务记录管理。"
         )
-        with gr.Row():
-            user_status = gr.Markdown()
-            gr.HTML('<a href="/logout" style="display:inline-block;padding:8px 12px;border:1px solid #ddd;border-radius:6px;text-decoration:none;">退出登录</a>')
+        user_status = gr.Markdown()
 
         with gr.Tab("单次推理"):
             with gr.Row():
