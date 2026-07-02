@@ -1,5 +1,6 @@
 import csv
 import functools
+import html
 import json
 import logging
 import os
@@ -1887,9 +1888,11 @@ def admin_disable_user(username: str, request: gr.Request) -> tuple[str, list[li
 
 def load_user_context(request: gr.Request) -> tuple[str, Any]:
     user = current_user(request)
+    username = html.escape(str(user["username"]))
+    role = html.escape(str(user["role"]))
     return (
-        f"当前用户：`{user['username']}`（{user['role']}） "
-        "[退出登录](/logout)",
+        f"当前用户：<code>{username}</code>（{role}） "
+        '<a href="/logout" target="_self" style="margin-left: 8px;">退出登录</a>',
         gr.update(visible=user.get("role") == task_store.ROLE_ADMIN),
     )
 
@@ -1993,7 +1996,7 @@ def build_demo() -> gr.Blocks:
             "# Qwen-Image-Edit-2511 Gradio WebUI\n"
             "支持多用户登录、单次推理、多图编辑、批量任务推理和任务记录管理。"
         )
-        user_status = gr.Markdown()
+        user_status = gr.HTML()
 
         with gr.Tab("单次推理"):
             with gr.Row():
