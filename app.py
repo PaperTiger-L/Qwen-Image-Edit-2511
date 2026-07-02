@@ -1839,9 +1839,31 @@ def format_jobs_table(jobs: list[dict[str, Any]]) -> list[list[Any]]:
     return rows
 
 
-def refresh_my_jobs(request: gr.Request) -> list[list[Any]]:
+JOB_STATUS_FILTERS = ["全部", "正在推理", "推理完成", "推理失败", "已中断"]
+JOB_STATUS_FILTER_MAP = {
+    "正在推理": {task_store.JOB_STATUS_QUEUED, task_store.JOB_STATUS_RUNNING, task_store.JOB_STATUS_FINALIZING},
+    "推理完成": {task_store.JOB_STATUS_COMPLETED},
+    "推理失败": {task_store.JOB_STATUS_FAILED},
+    "已中断": {task_store.JOB_STATUS_INTERRUPTED},
+}
+
+
+def filter_jobs(jobs: list[dict[str, Any]], status_filter: str = "全部", username_filter: str = "") -> list[dict[str, Any]]:
+    allowed_statuses = JOB_STATUS_FILTER_MAP.get(status_filter or "全部")
+    username_filter = (username_filter or "").strip().lower()
+    filtered = []
+    for job in jobs:
+        if allowed_statuses and job.get("status") not in allowed_statuses:
+            continue
+        if username_filter and username_filter not in str(job.get("username") or "").lower():
+            continue
+        filtered.append(job)
+    return filtered
+
+
+def refresh_my_jobs(status_filter: str = "全部", request: gr.Request = None) -> list[list[Any]]:
     user = current_user(request)
-    return format_jobs_table(task_store.list_jobs_for_user(user))
+    return format_jobs_table(filter_jobs(task_store.list_jobs_for_user(user), status_filter=status_filter))
 
 
 def load_job_detail(job_id: str, request: gr.Request) -> tuple[str, Any]:
@@ -1861,7 +1883,13 @@ def load_job_detail(job_id: str, request: gr.Request) -> tuple[str, Any]:
         f"- 阶段: {job.get('current_phase') or '-'}\n"
         f"- 错误: {job.get('last_error') or '-'}"
     )
-    detail += f"\n- 任务 ID: `{job['id']}`\n- 任务目录: `{job['session_dir']}`"
+    detail += f"\n- 任务 ID: `{job['id']}`"
+    if user.get("role") == task_store.ROLE_ADMIN:
+        detail += f"\n- 用户 ID: `{job.get('user_id')}`\n- 任务目录: `{job['session_dir']}`"
+        if job.get("manifest_file"):
+            detail += f"\n- Manifest: `{job['manifest_file']}`"
+        if job.get("uploaded_package_file"):
+            detail += f"\n- 上传包: `{job['uploaded_package_file']}`"
     download_path = job.get("results_zip_file") if job["job_type"].startswith("batch") else job.get("single_result_file")
     can_download = job.get("status") == task_store.JOB_STATUS_COMPLETED and bool(job.get("download_ready")) and download_path and Path(download_path).exists()
     return detail, gr.update(value=download_path if can_download else None, visible=bool(can_download))
@@ -1910,16 +1938,21 @@ def admin_disable_user(username: str, request: gr.Request) -> tuple[str, list[li
     return f"用户 `{username}` 已禁用。", admin_refresh_users(request)
 
 
-def admin_refresh_jobs(request: gr.Request) -> list[list[Any]]:
-    admin = current_admin(request)
-    return format_jobs_table(task_store.list_jobs_for_user(admin, limit=500))
+def admin_refresh_jobs(status_filter: str = "全部", username_filter: str = "", request: gr.Request = None) -> list[list[Any]]:
+    user = current_user(request)
+    if user.get("role") != task_store.ROLE_ADMIN:
+        return []
+    jobs = task_store.list_jobs_for_user(user, limit=500)
+    return format_jobs_table(filter_jobs(jobs, status_filter=status_filter, username_filter=username_filter))
 
 
-def admin_delete_job(job_id: str, request: gr.Request) -> tuple[str, list[list[Any]]]:
+def admin_delete_job(job_id: str, confirm_text: str, status_filter: str, username_filter: str, request: gr.Request) -> tuple[str, list[list[Any]]]:
     admin = current_admin(request)
     job_id = (job_id or "").strip()
     if not job_id:
         raise gr.Error("请输入要删除的任务 ID。")
+    if (confirm_text or "").strip() != "DELETE":
+        raise gr.Error("请输入 DELETE 确认删除。")
     job = task_store.get_job(job_id)
     if not job:
         raise gr.Error("任务不存在。")
@@ -1928,7 +1961,7 @@ def admin_delete_job(job_id: str, request: gr.Request) -> tuple[str, list[list[A
     delete_job_files(job)
     task_store.mark_job_deleted(job_id)
     task_store.audit(admin["id"], "delete_job", "job", job_id, {"owner": job.get("user_id"), "session_dir": job.get("session_dir")})
-    return f"任务 `{job_id}` 已删除。", admin_refresh_jobs(request)
+    return f"任务 `{job_id}` 已删除。", admin_refresh_jobs(status_filter, username_filter, request)
 
 
 def load_user_context(request: gr.Request) -> tuple[str, Any]:
@@ -2193,7 +2226,9 @@ def build_demo() -> gr.Blocks:
             )
 
         with gr.Tab("我的任务"):
-            refresh_jobs_button = gr.Button("刷新任务列表")
+            with gr.Row():
+                my_status_filter = gr.Dropdown(choices=JOB_STATUS_FILTERS, value="全部", label="状态筛选")
+                refresh_jobs_button = gr.Button("刷新任务列表")
             jobs_table = gr.Dataframe(
                 headers=["任务ID", "用户", "类型", "状态", "进度", "创建时间", "完成时间", "下载"],
                 datatype=["str", "str", "str", "str", "str", "str", "str", "str"],
@@ -2203,9 +2238,10 @@ def build_demo() -> gr.Blocks:
             job_detail_button = gr.Button("查看任务详情")
             job_detail = gr.Markdown()
             job_download = gr.File(label="下载结果", visible=False)
-            refresh_jobs_button.click(refresh_my_jobs, outputs=[jobs_table], queue=False, show_progress="hidden")
+            refresh_jobs_button.click(refresh_my_jobs, inputs=[my_status_filter], outputs=[jobs_table], queue=False, show_progress="hidden")
+            my_status_filter.change(refresh_my_jobs, inputs=[my_status_filter], outputs=[jobs_table], queue=False, show_progress="hidden")
             job_detail_button.click(load_job_detail, inputs=[job_id_input], outputs=[job_detail, job_download], queue=False, show_progress="hidden")
-            demo.load(refresh_my_jobs, outputs=[jobs_table], queue=False, show_progress="hidden")
+            demo.load(refresh_my_jobs, inputs=[my_status_filter], outputs=[jobs_table], queue=False, show_progress="hidden")
 
         with gr.Group(visible=False) as admin_panel:
             gr.Markdown("## 管理员面板")
@@ -2242,24 +2278,55 @@ def build_demo() -> gr.Blocks:
             demo.load(admin_refresh_users, outputs=[admin_users_table], queue=False, show_progress="hidden")
 
             gr.Markdown("### 任务管理")
-            admin_refresh_jobs_button = gr.Button("刷新全部任务")
+            with gr.Row():
+                admin_status_filter = gr.Dropdown(choices=JOB_STATUS_FILTERS, value="全部", label="状态筛选")
+                admin_username_filter = gr.Textbox(label="用户名筛选", placeholder="留空显示全部用户")
+                admin_refresh_jobs_button = gr.Button("刷新任务列表")
             admin_jobs_table = gr.Dataframe(
                 headers=["任务ID", "用户", "类型", "状态", "进度", "创建时间", "完成时间", "下载"],
                 datatype=["str", "str", "str", "str", "str", "str", "str", "str"],
                 interactive=False,
             )
-            admin_delete_job_id = gr.Textbox(label="要删除的任务 ID")
-            admin_delete_job_button = gr.Button("删除任务及服务器文件", variant="stop")
+            with gr.Row():
+                admin_delete_job_id = gr.Textbox(label="要删除的任务 ID")
+                admin_delete_confirm = gr.Textbox(label="删除确认", placeholder="输入 DELETE 后才能删除")
+                admin_delete_job_button = gr.Button("删除任务及服务器文件", variant="stop")
             admin_job_message = gr.Markdown()
-            admin_refresh_jobs_button.click(admin_refresh_jobs, outputs=[admin_jobs_table], queue=False, show_progress="hidden")
+            admin_refresh_jobs_button.click(
+                admin_refresh_jobs,
+                inputs=[admin_status_filter, admin_username_filter],
+                outputs=[admin_jobs_table],
+                queue=False,
+                show_progress="hidden",
+            )
+            admin_status_filter.change(
+                admin_refresh_jobs,
+                inputs=[admin_status_filter, admin_username_filter],
+                outputs=[admin_jobs_table],
+                queue=False,
+                show_progress="hidden",
+            )
+            admin_username_filter.change(
+                admin_refresh_jobs,
+                inputs=[admin_status_filter, admin_username_filter],
+                outputs=[admin_jobs_table],
+                queue=False,
+                show_progress="hidden",
+            )
             admin_delete_job_button.click(
                 admin_delete_job,
-                inputs=[admin_delete_job_id],
+                inputs=[admin_delete_job_id, admin_delete_confirm, admin_status_filter, admin_username_filter],
                 outputs=[admin_job_message, admin_jobs_table],
                 queue=False,
                 show_progress="hidden",
             )
-            demo.load(admin_refresh_jobs, outputs=[admin_jobs_table], queue=False, show_progress="hidden")
+            demo.load(
+                admin_refresh_jobs,
+                inputs=[admin_status_filter, admin_username_filter],
+                outputs=[admin_jobs_table],
+                queue=False,
+                show_progress="hidden",
+            )
 
         demo.load(load_user_context, outputs=[user_status, admin_panel], queue=False, show_progress="hidden")
 
