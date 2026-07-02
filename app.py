@@ -2144,39 +2144,39 @@ def build_demo() -> gr.Blocks:
             job_detail_button.click(load_job_detail, inputs=[job_id_input], outputs=[job_detail, job_download], queue=False, show_progress="hidden")
             demo.load(refresh_my_jobs, outputs=[jobs_table], queue=False, show_progress="hidden")
 
-        with gr.Tab("管理员面板"):
-            with gr.Group(visible=False) as admin_panel:
-                gr.Markdown("## 用户管理")
-                admin_refresh_button = gr.Button("刷新用户列表")
-                admin_users_table = gr.Dataframe(
-                    headers=["用户ID", "用户名", "角色", "状态", "创建时间", "最近登录"],
-                    datatype=["str", "str", "str", "str", "str", "str"],
-                    interactive=False,
-                )
-                with gr.Row():
-                    new_username = gr.Textbox(label="新用户名")
-                    new_password = gr.Textbox(label="新用户密码", type="password")
-                    new_role = gr.Radio(choices=[task_store.ROLE_USER, task_store.ROLE_ADMIN], value=task_store.ROLE_USER, label="角色")
-                admin_create_button = gr.Button("添加用户", variant="primary")
-                disable_username = gr.Textbox(label="要删除/禁用的用户名")
-                admin_disable_button = gr.Button("删除/禁用用户")
-                admin_message = gr.Markdown()
-                admin_refresh_button.click(admin_refresh_users, outputs=[admin_users_table], queue=False, show_progress="hidden")
-                admin_create_button.click(
-                    admin_create_user,
-                    inputs=[new_username, new_password, new_role],
-                    outputs=[admin_message, admin_users_table],
-                    queue=False,
-                    show_progress="hidden",
-                )
-                admin_disable_button.click(
-                    admin_disable_user,
-                    inputs=[disable_username],
-                    outputs=[admin_message, admin_users_table],
-                    queue=False,
-                    show_progress="hidden",
-                )
-                demo.load(admin_refresh_users, outputs=[admin_users_table], queue=False, show_progress="hidden")
+        with gr.Group(visible=False) as admin_panel:
+            gr.Markdown("## 管理员面板")
+            gr.Markdown("### 用户管理")
+            admin_refresh_button = gr.Button("刷新用户列表")
+            admin_users_table = gr.Dataframe(
+                headers=["用户ID", "用户名", "角色", "状态", "创建时间", "最近登录"],
+                datatype=["str", "str", "str", "str", "str", "str"],
+                interactive=False,
+            )
+            with gr.Row():
+                new_username = gr.Textbox(label="新用户名")
+                new_password = gr.Textbox(label="新用户密码", type="password")
+                new_role = gr.Radio(choices=[task_store.ROLE_USER, task_store.ROLE_ADMIN], value=task_store.ROLE_USER, label="角色")
+            admin_create_button = gr.Button("添加用户", variant="primary")
+            disable_username = gr.Textbox(label="要删除/禁用的用户名")
+            admin_disable_button = gr.Button("删除/禁用用户")
+            admin_message = gr.Markdown()
+            admin_refresh_button.click(admin_refresh_users, outputs=[admin_users_table], queue=False, show_progress="hidden")
+            admin_create_button.click(
+                admin_create_user,
+                inputs=[new_username, new_password, new_role],
+                outputs=[admin_message, admin_users_table],
+                queue=False,
+                show_progress="hidden",
+            )
+            admin_disable_button.click(
+                admin_disable_user,
+                inputs=[disable_username],
+                outputs=[admin_message, admin_users_table],
+                queue=False,
+                show_progress="hidden",
+            )
+            demo.load(admin_refresh_users, outputs=[admin_users_table], queue=False, show_progress="hidden")
 
         demo.load(load_user_context, outputs=[user_status, admin_panel], queue=False, show_progress="hidden")
 
