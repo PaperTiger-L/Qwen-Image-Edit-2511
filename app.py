@@ -110,6 +110,9 @@ def user_jobs_root(user: dict[str, Any]) -> Path:
 
 
 def user_local_batch_root(user: dict[str, Any]) -> Path:
+    if user.get("role") == task_store.ROLE_ADMIN:
+        LOCAL_BATCH_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+        return LOCAL_BATCH_INPUT_DIR
     root = LOCAL_BATCH_INPUT_DIR / "users" / user["id"]
     root.mkdir(parents=True, exist_ok=True)
     return root
@@ -1506,7 +1509,7 @@ def batch_examples_markdown() -> str:
     return (
         "### 批量任务文件格式\n"
         "支持两种模式：\n"
-        f"- **{BATCH_MODE_LOCAL}**：先把图片放到项目目录 `{LOCAL_BATCH_INPUT_DIR.name}/` 下，`images` 只写文件名或相对该目录的路径。\n"
+        f"- **{BATCH_MODE_LOCAL}**：管理员把图片放到项目目录 `{LOCAL_BATCH_INPUT_DIR.name}/` 下；普通用户放到 `{LOCAL_BATCH_INPUT_DIR.name}/users/<用户ID>/` 下，`images` 只写相对对应根目录的路径。\n"
         f"- **{BATCH_MODE_REMOTE}**：上传 `CSV/JSON` + `ZIP` 图片包，`images` 必须写成相对 `ZIP` 根目录的路径。\n"
         "多图输入在 CSV 中使用 `|` 分隔。远程上传模式建议用 `generate_batch_manifest.py --image-path-mode package-relative` 生成任务文件；服务端本地图片模式建议用 `--image-path-mode project-relative`。\n"
         "批量推理界面仅展示总进度，并在全部任务完成后提供一个最终结果 ZIP 下载入口。\n"
@@ -1529,8 +1532,8 @@ def batch_mode_help_text(batch_mode: str) -> str:
         )
     return (
         "**当前模式：服务端本地图片**\n\n"
-        f"- 请先把图片手动放到项目目录 `{LOCAL_BATCH_INPUT_DIR.name}/` 下。\n"
-        "- `images` 只能写文件名或相对该目录的路径。\n"
+        f"- 管理员请把图片手动放到项目目录 `{LOCAL_BATCH_INPUT_DIR.name}/` 下；普通用户放到 `{LOCAL_BATCH_INPUT_DIR.name}/users/<用户ID>/` 下。\n"
+        "- `images` 只能写文件名或相对对应图片根目录的路径。\n"
         "- 不支持绝对路径，也不支持项目目录之外的图片路径。"
     )
 
