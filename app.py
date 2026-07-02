@@ -71,6 +71,7 @@ _DEVICE: Optional[str] = None
 _DTYPE: Optional[torch.dtype] = None
 _DEVICE_MAP_INFO: Optional[str] = None
 _PIPELINE_EXECUTION_DEVICE: Optional[str] = None
+PIPELINE_LOCK = threading.Lock()
 
 
 @dataclass
@@ -1195,23 +1196,24 @@ def run_generation(
     if width is not None and (width <= 0 or height <= 0):
         raise gr.Error("宽度和高度必须为正整数。")
 
-    pipeline = get_pipeline()
-    generator_device = _PIPELINE_EXECUTION_DEVICE or _DEVICE or "cpu"
-    generator = torch.Generator(device=generator_device).manual_seed(int(seed))
     images = load_images(image_paths)
-    with torch.inference_mode():
-        result = pipeline(
-            image=images,
-            prompt=prompt,
-            negative_prompt=negative_prompt or " ",
-            generator=generator,
-            true_cfg_scale=true_cfg_scale,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            num_images_per_prompt=1,
-            width=width,
-            height=height,
-        )
+    with PIPELINE_LOCK:
+        pipeline = get_pipeline()
+        generator_device = _PIPELINE_EXECUTION_DEVICE or _DEVICE or "cpu"
+        generator = torch.Generator(device=generator_device).manual_seed(int(seed))
+        with torch.inference_mode():
+            result = pipeline(
+                image=images,
+                prompt=prompt,
+                negative_prompt=negative_prompt or " ",
+                generator=generator,
+                true_cfg_scale=true_cfg_scale,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                num_images_per_prompt=1,
+                width=width,
+                height=height,
+            )
     return result.images[0]
 
 
