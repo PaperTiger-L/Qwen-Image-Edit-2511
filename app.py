@@ -7,6 +7,7 @@ import shutil
 import stat
 import threading
 import time
+import traceback
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -17,6 +18,10 @@ from typing import Any, List, Optional
 import gradio as gr
 import torch
 from PIL import Image
+
+import auth
+import cleanup as cleanup_jobs
+import task_store
 from diffusers import QwenImageEditPlusPipeline
 from diffusers.models.transformers.transformer_qwenimage import compute_text_seq_len_from_mask
 from diffusers.models.transformers.transformer_2d import Transformer2DModelOutput
@@ -33,6 +38,7 @@ MODEL_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = MODEL_DIR / "outputs"
 BATCH_OUTPUT_DIR = OUTPUT_DIR / "batch"
 SINGLE_OUTPUT_DIR = OUTPUT_DIR / "single"
+USERS_OUTPUT_DIR = OUTPUT_DIR / "users"
 LOCAL_BATCH_INPUT_DIR = MODEL_DIR / "batch_inputs"
 RETENTION_DAYS = int(os.getenv("OUTPUT_RETENTION_DAYS", "7"))
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", str(6 * 60 * 60)))
@@ -44,6 +50,7 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 OUTPUT_DIR.mkdir(exist_ok=True)
 BATCH_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SINGLE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+USERS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOCAL_BATCH_INPUT_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 LOGGER = logging.getLogger(__name__)
@@ -76,6 +83,36 @@ class BatchItem:
     num_inference_steps: int
     guidance_scale: float
     true_cfg_scale: float
+
+
+def request_username(request: Optional[gr.Request]) -> Optional[str]:
+    return getattr(request, "username", None) if request is not None else None
+
+
+def current_user(request: Optional[gr.Request]) -> dict[str, Any]:
+    try:
+        return auth.require_user(request_username(request))
+    except PermissionError as exc:
+        raise gr.Error(str(exc)) from exc
+
+
+def current_admin(request: Optional[gr.Request]) -> dict[str, Any]:
+    try:
+        return auth.require_admin(request_username(request))
+    except PermissionError as exc:
+        raise gr.Error(str(exc)) from exc
+
+
+def user_jobs_root(user: dict[str, Any]) -> Path:
+    root = USERS_OUTPUT_DIR / user["id"] / "jobs"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def user_local_batch_root(user: dict[str, Any]) -> Path:
+    root = LOCAL_BATCH_INPUT_DIR / "users" / user["id"]
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def now_utc() -> datetime:
@@ -416,6 +453,8 @@ def cleanup_old_outputs() -> None:
 def cleanup_loop() -> None:
     while True:
         try:
+            cleanup_jobs.reconcile_interrupted_jobs()
+            cleanup_jobs.cleanup_expired_jobs()
             cleanup_old_outputs()
         except Exception as exc:
             LOGGER.exception("Cleanup pass failed: %s", exc)
@@ -467,6 +506,8 @@ def reconcile_in_progress_batch_sessions() -> None:
 
 
 def start_cleanup_scheduler() -> None:
+    cleanup_jobs.reconcile_interrupted_jobs()
+    cleanup_jobs.cleanup_expired_jobs()
     reconcile_in_progress_batch_sessions()
     cleanup_old_outputs()
     cleanup_thread = threading.Thread(target=cleanup_loop, name="output-cleanup", daemon=True)
@@ -1197,13 +1238,20 @@ def infer_single(
     true_cfg_scale,
     width,
     height,
+    request: gr.Request,
 ):
+    user = current_user(request)
     image_paths = parse_uploaded_images(images)
-    session_dir = create_session_dir(SINGLE_OUTPUT_DIR, "qwen_image_edit_single")
+    session_dir = create_session_dir(user_jobs_root(user), "qwen_image_edit_single")
+    job = task_store.create_job(user["id"], "single", session_dir, status=task_store.JOB_STATUS_RUNNING)
     metadata = initialize_session(session_dir, session_type="single")
+    metadata["user_id"] = user["id"]
+    metadata["username"] = user["username"]
+    metadata["job_id"] = job["id"]
     try:
         persisted_inputs = persist_single_inputs(image_paths, session_dir)
         metadata["input_files"] = [str(path) for path in persisted_inputs]
+        task_store.update_job(job["id"], current_phase="正在推理", heartbeat_at=isoformat_utc(now_utc()))
         result = run_generation(
             image_paths=image_paths,
             prompt=prompt,
@@ -1217,14 +1265,33 @@ def infer_single(
         )
         saved_path = save_single_result(result, session_dir, image_paths, seed)
         metadata["result_files"] = [saved_path]
+        task_store.finish_job(
+            job["id"],
+            task_store.JOB_STATUS_COMPLETED,
+            single_result_file=saved_path,
+            download_ready=1,
+            progress=1.0,
+            completed_items=1,
+            success_items=1,
+            current_phase="处理完成",
+        )
         finalize_session(session_dir, metadata, status="completed")
-    except Exception:
+    except Exception as exc:
+        metadata["last_error"] = str(exc)
+        task_store.finish_job(
+            job["id"],
+            task_store.JOB_STATUS_FAILED,
+            last_error=str(exc),
+            current_phase="任务失败",
+        )
         finalize_session(session_dir, metadata, status="failed")
         raise
 
     resolution_text = "自动" if not width and not height else f"{int(width)} × {int(height)}"
     status = (
         f"推理完成\n\n"
+        f"- 任务 ID: `{job['id']}`\n"
+        f"- 用户: `{user['username']}`\n"
         f"- device: `{_DEVICE}`\n"
         f"- dtype: `{_DTYPE}`\n"
         f"- device_map: `{_DEVICE_MAP_INFO}`\n"
@@ -1480,80 +1547,133 @@ def reset_batch_outputs(batch_mode: str = BATCH_MODE_REMOTE):
 
 
 
-def execute_batch_session(session_dir: Path, metadata: dict[str, Any], items: list[BatchItem]) -> None:
-    session_id = batch_session_id(session_dir)
-    rows: list[dict[str, Any]] = []
+def job_metadata(job: dict[str, Any]) -> dict[str, Any]:
+    status = job.get("status")
+    session_type = job.get("job_type")
+    metadata = {
+        "session_type": session_type,
+        "user_id": job.get("user_id"),
+        "job_id": job.get("id"),
+        "status": status,
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "expire_at": job.get("retention_expire_at"),
+        "input_files": [],
+        "result_files": [],
+        "manifest_file": job.get("manifest_file"),
+        "uploaded_package_file": job.get("uploaded_package_file"),
+        "extracted_package_dir": job.get("extracted_package_dir"),
+        "batch_mode": job.get("batch_mode"),
+        "total_items": job.get("total_items") or 0,
+        "completed_items": job.get("completed_items") or 0,
+        "success_items": job.get("success_items") or 0,
+        "failed_items": job.get("failed_items") or 0,
+        "current_index": job.get("current_index") or 0,
+        "current_row_id": job.get("current_row_id"),
+        "current_phase": job.get("current_phase"),
+        "progress": job.get("progress") or 0.0,
+        "results_json_file": job.get("results_json_file"),
+        "results_csv_file": job.get("results_csv_file"),
+        "results_zip_file": job.get("results_zip_file"),
+        "download_ready": bool(job.get("download_ready")),
+        "last_error": job.get("last_error"),
+    }
+    if job.get("single_result_file"):
+        metadata["result_files"] = [job["single_result_file"]]
+    if job.get("results_zip_file"):
+        metadata["result_files"] = [path for path in [job.get("results_csv_file"), job.get("results_json_file"), job.get("results_zip_file")] if path]
+    return metadata
+
+
+def write_job_metadata(job: dict[str, Any]) -> None:
+    session_dir = Path(job["session_dir"])
+    write_session_metadata(session_dir, job_metadata(job))
+
+
+def execute_batch_session(job_id: str) -> None:
     result_files: list[str] = []
     try:
-        metadata["status"] = BATCH_STATUS_RUNNING
-        metadata["started_at"] = isoformat_utc(now_utc())
-        metadata["current_phase"] = "正在处理"
-        write_session_metadata(session_dir, metadata)
+        job = task_store.get_job(job_id)
+        if not job:
+            raise RuntimeError(f"批量任务不存在: {job_id}")
+        session_dir = Path(job["session_dir"])
+        task_store.update_job(
+            job_id,
+            status=task_store.JOB_STATUS_RUNNING,
+            started_at=job.get("started_at") or isoformat_utc(now_utc()),
+            current_phase="正在处理",
+            heartbeat_at=isoformat_utc(now_utc()),
+        )
+        write_job_metadata(task_store.get_job(job_id))
 
-        for idx, item in enumerate(items, start=1):
-            metadata["current_index"] = idx
-            metadata["current_row_id"] = item.row_id
-            metadata["current_phase"] = f"批量处理中 {idx}/{len(items)}"
-            write_session_metadata(session_dir, metadata)
+        items = task_store.list_job_items(job_id)
+        total_items = len(items)
+        for item in items:
+            if item["status"] in {task_store.JOB_ITEM_SUCCESS, task_store.JOB_ITEM_FAILED}:
+                continue
+            idx = int(item["row_index"])
+            image_paths = [Path(path) for path in task_store.loads_json(item["resolved_image_paths_json"], [])]
+            image_refs = task_store.loads_json(item["image_refs_json"], [])
+            task_store.update_job_item(item["id"], status=task_store.JOB_ITEM_RUNNING, started_at=isoformat_utc(now_utc()))
+            task_store.update_job(
+                job_id,
+                current_index=idx,
+                current_row_id=item["row_id"],
+                current_phase=f"批量处理中 {idx}/{total_items}",
+                heartbeat_at=isoformat_utc(now_utc()),
+            )
+            write_job_metadata(task_store.get_job(job_id))
             try:
                 result = run_generation(
-                    image_paths=item.image_paths,
-                    prompt=item.prompt,
-                    negative_prompt=item.negative_prompt,
-                    seed=item.seed,
-                    num_inference_steps=item.num_inference_steps,
-                    guidance_scale=item.guidance_scale,
-                    true_cfg_scale=item.true_cfg_scale,
+                    image_paths=image_paths,
+                    prompt=item["prompt"],
+                    negative_prompt=item["negative_prompt"],
+                    seed=item["seed"],
+                    num_inference_steps=item["num_inference_steps"],
+                    guidance_scale=item["guidance_scale"],
+                    true_cfg_scale=item["true_cfg_scale"],
                 )
-                input_stem = get_primary_input_stem(item.image_paths)
-                file_name = f"{idx:03d}_{input_stem}.png"
-                output_path = session_dir / file_name
+                input_stem = get_primary_input_stem(image_paths)
+                output_path = session_dir / f"{idx:03d}_{input_stem}.png"
                 result.save(output_path)
                 result_files.append(str(output_path))
-                rows.append(
-                    {
-                        "id": item.row_id,
-                        "prompt": item.prompt,
-                        "negative_prompt": item.negative_prompt,
-                        "images": "|".join(item.image_refs),
-                        "seed": item.seed,
-                        "num_inference_steps": item.num_inference_steps,
-                        "guidance_scale": item.guidance_scale,
-                        "true_cfg_scale": item.true_cfg_scale,
-                        "status": "success",
-                        "output_image": str(output_path),
-                        "error": "",
-                    }
+                task_store.update_job_item(
+                    item["id"],
+                    status=task_store.JOB_ITEM_SUCCESS,
+                    output_image=str(output_path),
+                    error="",
+                    traceback="",
+                    finished_at=isoformat_utc(now_utc()),
                 )
-                metadata["success_items"] = int(metadata.get("success_items") or 0) + 1
             except Exception as exc:
-                rows.append(
-                    {
-                        "id": item.row_id,
-                        "prompt": item.prompt,
-                        "negative_prompt": item.negative_prompt,
-                        "images": "|".join(item.image_refs),
-                        "seed": item.seed,
-                        "num_inference_steps": item.num_inference_steps,
-                        "guidance_scale": item.guidance_scale,
-                        "true_cfg_scale": item.true_cfg_scale,
-                        "status": "failed",
-                        "output_image": "",
-                        "error": str(exc),
-                    }
+                error_traceback = traceback.format_exc()
+                LOGGER.error(
+                    "Batch item failed: job=%s row_id=%s images=%s\n%s",
+                    job_id,
+                    item["row_id"],
+                    "|".join(image_refs),
+                    error_traceback,
                 )
-                metadata["failed_items"] = int(metadata.get("failed_items") or 0) + 1
+                task_store.update_job_item(
+                    item["id"],
+                    status=task_store.JOB_ITEM_FAILED,
+                    output_image="",
+                    error=str(exc),
+                    traceback=error_traceback if os.getenv("INCLUDE_TRACEBACK_IN_RESULTS", "0") == "1" else "",
+                    finished_at=isoformat_utc(now_utc()),
+                )
 
-            metadata["completed_items"] = idx
-            metadata["progress"] = idx / len(items)
+            task_store.update_job_progress_from_items(job_id)
+            rows = task_store.rows_for_batch_results(job_id)
             write_partial_batch_results(session_dir, rows)
-            write_session_metadata(session_dir, metadata)
+            write_job_metadata(task_store.get_job(job_id))
 
-        metadata["status"] = BATCH_STATUS_FINALIZING
-        metadata["current_phase"] = "正在整理结果"
-        metadata["current_row_id"] = None
-        write_session_metadata(session_dir, metadata)
+        task_store.update_job(job_id, status=task_store.JOB_STATUS_FINALIZING, current_phase="正在整理结果", current_row_id=None)
+        write_job_metadata(task_store.get_job(job_id))
 
+        rows = task_store.rows_for_batch_results(job_id)
         csv_path = session_dir / "batch_results.csv"
         with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(
@@ -1570,6 +1690,7 @@ def execute_batch_session(session_dir: Path, metadata: dict[str, Any], items: li
                     "status",
                     "output_image",
                     "error",
+                    "traceback",
                 ],
             )
             writer.writeheader()
@@ -1587,24 +1708,46 @@ def execute_batch_session(session_dir: Path, metadata: dict[str, Any], items: li
                 if row["output_image"]:
                     zf.write(row["output_image"], arcname=Path(row["output_image"]).name)
 
-        metadata["progress"] = 1.0
-        metadata["current_index"] = len(items)
-        metadata["current_phase"] = "处理完成"
-        metadata["results_csv_file"] = str(csv_path)
-        metadata["results_json_file"] = str(json_path)
-        metadata["results_zip_file"] = str(zip_path)
-        metadata["download_ready"] = True
-        metadata["input_files"] = [str(path) for item in items for path in item.image_paths]
-        metadata["result_files"] = result_files + [str(csv_path), str(json_path), str(zip_path)]
-        finalize_session(session_dir, metadata, status=BATCH_STATUS_COMPLETED)
+        task_store.finish_job(
+            job_id,
+            task_store.JOB_STATUS_COMPLETED,
+            progress=1.0,
+            current_index=total_items,
+            current_phase="处理完成",
+            results_csv_file=str(csv_path),
+            results_json_file=str(json_path),
+            results_zip_file=str(zip_path),
+            download_ready=1,
+        )
+        write_job_metadata(task_store.get_job(job_id))
     except Exception as exc:
-        metadata["last_error"] = str(exc)
-        metadata["current_phase"] = "任务失败"
-        finalize_session(session_dir, metadata, status=BATCH_STATUS_FAILED)
-        LOGGER.exception("Batch session failed: %s", session_dir)
+        task_store.finish_job(job_id, task_store.JOB_STATUS_FAILED, last_error=str(exc), current_phase="任务失败")
+        job = task_store.get_job(job_id)
+        if job:
+            write_job_metadata(job)
+        LOGGER.exception("Batch session failed: %s", job_id)
     finally:
-        unregister_active_batch_thread(session_id)
+        unregister_active_batch_thread(job_id)
 
+
+
+def batch_status_payload_from_job(job: dict[str, Any]) -> tuple[str, str, Optional[str], bool, bool]:
+    metadata = job_metadata(job)
+    progress_markdown = format_batch_progress_markdown(metadata)
+    status = job.get("status")
+    keep_polling = status in {task_store.JOB_STATUS_QUEUED, task_store.JOB_STATUS_RUNNING, task_store.JOB_STATUS_FINALIZING}
+    allow_submit = not keep_polling
+    summary = ""
+    zip_path = None
+    if status == task_store.JOB_STATUS_COMPLETED:
+        summary = format_batch_summary(metadata, Path(job["session_dir"]))
+        candidate = job.get("results_zip_file")
+        if job.get("download_ready") and candidate and Path(candidate).exists():
+            zip_path = candidate
+    elif status in {task_store.JOB_STATUS_FAILED, task_store.JOB_STATUS_INTERRUPTED}:
+        error_text = job.get("last_error") or "批量任务执行失败。"
+        summary = f"批量推理{('中断' if status == task_store.JOB_STATUS_INTERRUPTED else '失败')}\n\n- 任务目录: `{job['session_dir']}`\n- 错误: {error_text}"
+    return progress_markdown, summary, zip_path, keep_polling, allow_submit
 
 
 def load_batch_session_status(
@@ -1612,28 +1755,18 @@ def load_batch_session_status(
     *,
     restore_on_load: bool,
     default_batch_mode: str = BATCH_MODE_REMOTE,
+    request: gr.Request = None,
 ) -> tuple[str, str, Any, str, Any, Any, Any, Any, Any]:
     if not session_id:
         return empty_batch_status_view(batch_mode=default_batch_mode)
 
-    session_dir = batch_session_dir_from_id(session_id)
-    if not session_dir.exists():
+    user = current_user(request)
+    job = task_store.get_job_for_user(session_id, user)
+    if not job:
         return empty_batch_status_view(batch_mode=default_batch_mode)
 
-    metadata = read_session_metadata(session_dir)
-    mode_value = metadata.get("batch_mode") or default_batch_mode
-    if metadata.get("status") in {BATCH_STATUS_PENDING, BATCH_STATUS_RUNNING, BATCH_STATUS_FINALIZING} and not is_active_batch_thread(session_id):
-        metadata["last_error"] = metadata.get("last_error") or "服务重启或任务线程中断，批量任务未完成。"
-        metadata["current_phase"] = "任务中断"
-        finalize_session(session_dir, metadata, status=BATCH_STATUS_FAILED)
-        metadata = read_session_metadata(session_dir)
-
-    if not is_batch_session_recoverable(session_dir, metadata):
-        return empty_batch_status_view(batch_mode=mode_value)
-
-    progress_markdown, summary, zip_path, keep_polling, allow_submit = batch_status_payload(session_dir, metadata)
-    if restore_on_load and metadata.get("status") == BATCH_STATUS_PENDING:
-        progress_markdown = format_batch_progress_markdown(metadata)
+    mode_value = job.get("batch_mode") or default_batch_mode
+    progress_markdown, summary, zip_path, keep_polling, allow_submit = batch_status_payload_from_job(job)
     zip_update = gr.update(value=zip_path, visible=bool(zip_path)) if zip_path else gr.update(value=None, visible=False)
     return (
         progress_markdown,
@@ -1649,17 +1782,112 @@ def load_batch_session_status(
 
 
 
-def poll_batch_status(session_id: str, batch_mode: str):
-    return load_batch_session_status(session_id, restore_on_load=False, default_batch_mode=batch_mode)
+def poll_batch_status(session_id: str, batch_mode: str, request: gr.Request):
+    return load_batch_session_status(session_id, restore_on_load=False, default_batch_mode=batch_mode, request=request)
 
 
 
-def restore_batch_session_on_load(session_id: str, batch_mode: str):
-    return load_batch_session_status(session_id, restore_on_load=True, default_batch_mode=batch_mode)
+def restore_batch_session_on_load(session_id: str, batch_mode: str, request: gr.Request):
+    return load_batch_session_status(session_id, restore_on_load=True, default_batch_mode=batch_mode, request=request)
 
 
 
-def start_batch(manifest_file, batch_mode, image_package=None):
+def format_jobs_table(jobs: list[dict[str, Any]]) -> list[list[Any]]:
+    rows = []
+    for job in jobs:
+        rows.append(
+            [
+                job.get("id"),
+                job.get("username", ""),
+                job.get("job_type"),
+                job.get("status"),
+                f"{float(job.get('progress') or 0.0) * 100:.1f}%",
+                job.get("created_at"),
+                job.get("finished_at") or "",
+                "可下载" if job.get("status") == task_store.JOB_STATUS_COMPLETED and job.get("download_ready") else "不可下载",
+            ]
+        )
+    return rows
+
+
+def refresh_my_jobs(request: gr.Request) -> list[list[Any]]:
+    user = current_user(request)
+    return format_jobs_table(task_store.list_jobs_for_user(user))
+
+
+def load_job_detail(job_id: str, request: gr.Request) -> tuple[str, Any]:
+    user = current_user(request)
+    job_id = (job_id or "").strip()
+    if not job_id:
+        return "请输入任务 ID。", gr.update(value=None, visible=False)
+    job = task_store.get_job_for_user(job_id, user)
+    if not job:
+        return "任务不存在，或你没有权限查看。", gr.update(value=None, visible=False)
+
+    metadata = job_metadata(job)
+    detail = format_batch_progress_markdown(metadata) if job["job_type"].startswith("batch") else (
+        "### 单次任务状态\n"
+        f"- 状态: {job['status']}\n"
+        f"- 进度: {float(job.get('progress') or 0.0) * 100:.1f}%\n"
+        f"- 阶段: {job.get('current_phase') or '-'}\n"
+        f"- 错误: {job.get('last_error') or '-'}"
+    )
+    detail += f"\n- 任务 ID: `{job['id']}`\n- 任务目录: `{job['session_dir']}`"
+    download_path = job.get("results_zip_file") if job["job_type"].startswith("batch") else job.get("single_result_file")
+    can_download = job.get("status") == task_store.JOB_STATUS_COMPLETED and bool(job.get("download_ready")) and download_path and Path(download_path).exists()
+    return detail, gr.update(value=download_path if can_download else None, visible=bool(can_download))
+
+
+def admin_refresh_users(request: gr.Request) -> list[list[Any]]:
+    user = current_user(request)
+    if user.get("role") != task_store.ROLE_ADMIN:
+        return []
+    return [
+        [
+            user["id"],
+            user["username"],
+            user["role"],
+            "启用" if user["is_active"] else "禁用",
+            user["created_at"],
+            user.get("last_login_at") or "",
+        ]
+        for user in task_store.list_users()
+    ]
+
+
+def admin_create_user(username: str, password: str, role: str, request: gr.Request) -> tuple[str, list[list[Any]]]:
+    admin = current_admin(request)
+    role = role or task_store.ROLE_USER
+    if role not in task_store.USER_ROLES:
+        raise gr.Error("无效用户角色。")
+    try:
+        user = auth.create_user(username, password, role=role)
+        task_store.audit(admin["id"], "create_user", "user", user["id"], {"username": username, "role": role})
+        return f"用户 `{username}` 创建成功。", admin_refresh_users(request)
+    except Exception as exc:
+        raise gr.Error(f"创建用户失败: {exc}") from exc
+
+
+def admin_disable_user(username: str, request: gr.Request) -> tuple[str, list[list[Any]]]:
+    admin = current_admin(request)
+    username = (username or "").strip()
+    user = task_store.get_user_by_username(username)
+    if not user:
+        raise gr.Error("用户不存在。")
+    if user["id"] == admin["id"]:
+        raise gr.Error("不能禁用当前管理员账号。")
+    task_store.set_user_active(user["id"], False)
+    task_store.audit(admin["id"], "disable_user", "user", user["id"], {"username": username})
+    return f"用户 `{username}` 已禁用。", admin_refresh_users(request)
+
+
+def load_user_context(request: gr.Request) -> tuple[str, Any]:
+    user = current_user(request)
+    return f"当前用户：`{user['username']}`（{user['role']}）", gr.update(visible=user.get("role") == task_store.ROLE_ADMIN)
+
+
+def start_batch(manifest_file, batch_mode, image_package=None, request: gr.Request = None):
+    user = current_user(request)
     if manifest_file is None:
         raise gr.Error("请先上传批量任务文件。")
     if batch_mode not in {BATCH_MODE_REMOTE, BATCH_MODE_LOCAL}:
@@ -1667,56 +1895,84 @@ def start_batch(manifest_file, batch_mode, image_package=None):
     if batch_mode == BATCH_MODE_REMOTE and image_package is None:
         raise gr.Error("远程上传模式必须同时上传图片包 ZIP。")
 
-    session_dir = create_session_dir(BATCH_OUTPUT_DIR, "qwen_image_edit_batch")
+    session_dir = create_session_dir(user_jobs_root(user), "qwen_image_edit_batch")
     session_id = batch_session_id(session_dir)
     session_type = "batch_remote" if batch_mode == BATCH_MODE_REMOTE else "batch_local"
+    job = task_store.create_job(user["id"], session_type, session_dir, status=task_store.JOB_STATUS_QUEUED, batch_mode=batch_mode)
     metadata = initialize_session(session_dir, session_type=session_type)
+    metadata["user_id"] = user["id"]
+    metadata["username"] = user["username"]
+    metadata["job_id"] = job["id"]
     metadata["batch_mode"] = batch_mode
 
     try:
         persisted_manifest, persisted_package = persist_batch_uploads(session_dir, manifest_file, image_package)
         metadata["manifest_file"] = str(persisted_manifest)
+        job_update = {"manifest_file": str(persisted_manifest), "current_phase": "正在初始化"}
         if persisted_package is not None:
             metadata["uploaded_package_file"] = str(persisted_package)
+            job_update["uploaded_package_file"] = str(persisted_package)
+        task_store.update_job(job["id"], **job_update)
 
         package_root = prepare_batch_image_package(persisted_package, session_dir)
         if package_root is not None:
             metadata["extracted_package_dir"] = str(package_root)
+            task_store.update_job(job["id"], extracted_package_dir=str(package_root))
 
+        local_root = user_local_batch_root(user)
         items = parse_batch_manifest(
             persisted_manifest,
             batch_mode=batch_mode,
             package_root=package_root,
-            local_batch_root=LOCAL_BATCH_INPUT_DIR,
+            local_batch_root=local_root,
         )
         if not items:
             raise gr.Error("批量任务文件为空。")
 
-        metadata["total_items"] = len(items)
-        metadata["completed_items"] = 0
-        metadata["success_items"] = 0
-        metadata["failed_items"] = 0
-        metadata["current_index"] = 0
-        metadata["current_row_id"] = None
-        metadata["current_phase"] = "等待后台任务启动"
-        metadata["progress"] = 0.0
-        metadata["download_ready"] = False
-        metadata["last_error"] = None
+        for index, item in enumerate(items, start=1):
+            task_store.create_job_item(
+                job_id=job["id"],
+                row_index=index,
+                row_id=item.row_id,
+                prompt=item.prompt,
+                negative_prompt=item.negative_prompt,
+                image_refs=item.image_refs,
+                image_paths=item.image_paths,
+                seed=item.seed,
+                num_inference_steps=item.num_inference_steps,
+                guidance_scale=item.guidance_scale,
+                true_cfg_scale=item.true_cfg_scale,
+            )
+
+        task_store.update_job(
+            job["id"],
+            total_items=len(items),
+            completed_items=0,
+            success_items=0,
+            failed_items=0,
+            current_index=0,
+            current_row_id=None,
+            current_phase="等待后台任务启动",
+            progress=0.0,
+            download_ready=0,
+            last_error=None,
+        )
         write_partial_batch_results(session_dir, [])
-        write_session_metadata(session_dir, metadata)
+        write_job_metadata(task_store.get_job(job["id"]))
 
         worker = threading.Thread(
             target=execute_batch_session,
-            args=(session_dir, metadata, items),
+            args=(job["id"],),
             name=f"batch-worker-{session_id}",
             daemon=True,
         )
         register_active_batch_thread(session_id, worker)
         worker.start()
-        return load_batch_session_status(session_id, restore_on_load=False, default_batch_mode=batch_mode)
+        return load_batch_session_status(session_id, restore_on_load=False, default_batch_mode=batch_mode, request=request)
     except Exception as exc:
         metadata["last_error"] = str(exc)
         metadata["current_phase"] = "任务初始化失败"
+        task_store.finish_job(job["id"], task_store.JOB_STATUS_FAILED, last_error=str(exc), current_phase="任务初始化失败")
         finalize_session(session_dir, metadata, status=BATCH_STATUS_FAILED)
         raise
 
@@ -1725,8 +1981,9 @@ def build_demo() -> gr.Blocks:
     with gr.Blocks(title="Qwen-Image-Edit-2511 WebUI") as demo:
         gr.Markdown(
             "# Qwen-Image-Edit-2511 Gradio WebUI\n"
-            "支持单次推理、多图编辑和批量任务推理。模型从当前目录本地加载。"
+            "支持多用户登录、单次推理、多图编辑、批量任务推理和任务记录管理。"
         )
+        user_status = gr.Markdown()
 
         with gr.Tab("单次推理"):
             with gr.Row():
@@ -1856,10 +2113,58 @@ def build_demo() -> gr.Blocks:
                 ],
             )
 
+        with gr.Tab("我的任务"):
+            refresh_jobs_button = gr.Button("刷新任务列表")
+            jobs_table = gr.Dataframe(
+                headers=["任务ID", "用户", "类型", "状态", "进度", "创建时间", "完成时间", "下载"],
+                datatype=["str", "str", "str", "str", "str", "str", "str", "str"],
+                interactive=False,
+            )
+            job_id_input = gr.Textbox(label="任务 ID", placeholder="从上方表格复制任务 ID")
+            job_detail_button = gr.Button("查看任务详情")
+            job_detail = gr.Markdown()
+            job_download = gr.File(label="下载结果", visible=False)
+            refresh_jobs_button.click(refresh_my_jobs, outputs=[jobs_table])
+            job_detail_button.click(load_job_detail, inputs=[job_id_input], outputs=[job_detail, job_download])
+            demo.load(refresh_my_jobs, outputs=[jobs_table])
+
+        with gr.Tab("管理员面板"):
+            with gr.Group(visible=False) as admin_panel:
+                gr.Markdown("## 用户管理")
+                admin_refresh_button = gr.Button("刷新用户列表")
+                admin_users_table = gr.Dataframe(
+                    headers=["用户ID", "用户名", "角色", "状态", "创建时间", "最近登录"],
+                    datatype=["str", "str", "str", "str", "str", "str"],
+                    interactive=False,
+                )
+                with gr.Row():
+                    new_username = gr.Textbox(label="新用户名")
+                    new_password = gr.Textbox(label="新用户密码", type="password")
+                    new_role = gr.Radio(choices=[task_store.ROLE_USER, task_store.ROLE_ADMIN], value=task_store.ROLE_USER, label="角色")
+                admin_create_button = gr.Button("添加用户", variant="primary")
+                disable_username = gr.Textbox(label="要删除/禁用的用户名")
+                admin_disable_button = gr.Button("删除/禁用用户")
+                admin_message = gr.Markdown()
+                admin_refresh_button.click(admin_refresh_users, outputs=[admin_users_table])
+                admin_create_button.click(
+                    admin_create_user,
+                    inputs=[new_username, new_password, new_role],
+                    outputs=[admin_message, admin_users_table],
+                )
+                admin_disable_button.click(
+                    admin_disable_user,
+                    inputs=[disable_username],
+                    outputs=[admin_message, admin_users_table],
+                )
+                demo.load(admin_refresh_users, outputs=[admin_users_table])
+
+        demo.load(load_user_context, outputs=[user_status, admin_panel])
+
     return demo
 
 
 if __name__ == "__main__":
+    auth.initialize_auth()
     start_cleanup_scheduler()
     demo = build_demo()
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    demo.launch(server_name="0.0.0.0", server_port=7860, auth=auth.authenticate)
