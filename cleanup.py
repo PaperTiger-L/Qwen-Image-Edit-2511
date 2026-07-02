@@ -28,8 +28,23 @@ def cleanup_expired_jobs() -> dict[str, int]:
         try:
             task_store.mark_job_deleting(job["id"])
             session_dir = Path(job["session_dir"])
-            if session_dir.exists():
-                shutil.rmtree(session_dir)
+            paths_to_delete = [session_dir]
+            for key in ("manifest_file", "uploaded_package_file", "extracted_package_dir"):
+                value = job.get(key)
+                if value:
+                    path = Path(value)
+                    if path.name in {"uploads", "input_package"}:
+                        paths_to_delete.append(path)
+                        paths_to_delete.append(path.parent)
+                    else:
+                        paths_to_delete.append(path.parent)
+                        paths_to_delete.append(path.parent.parent)
+            for path in sorted(set(paths_to_delete), key=lambda item: len(str(item)), reverse=True):
+                if path.exists():
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
             task_store.mark_job_deleted(job["id"])
             deleted += 1
             LOGGER.info("Deleted expired job: id=%s session_dir=%s", job["id"], session_dir)

@@ -103,17 +103,19 @@ def current_admin(request: Optional[gr.Request]) -> dict[str, Any]:
         raise gr.Error(str(exc)) from exc
 
 
+def user_storage_name(user: dict[str, Any]) -> str:
+    username = str(user.get("username") or user.get("id") or "user")
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in username)[:80] or "user"
+
+
 def user_jobs_root(user: dict[str, Any]) -> Path:
-    root = USERS_OUTPUT_DIR / user["id"] / "jobs"
+    root = USERS_OUTPUT_DIR / user_storage_name(user) / "jobs"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
 def user_local_batch_root(user: dict[str, Any]) -> Path:
-    if user.get("role") == task_store.ROLE_ADMIN:
-        LOCAL_BATCH_INPUT_DIR.mkdir(parents=True, exist_ok=True)
-        return LOCAL_BATCH_INPUT_DIR
-    root = LOCAL_BATCH_INPUT_DIR / "users" / user["id"]
+    root = LOCAL_BATCH_INPUT_DIR / "users" / user_storage_name(user)
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -1350,8 +1352,8 @@ def ensure_relative_to_root(path: Path, root: Path) -> None:
 
 
 
-def persist_batch_uploads(session_dir: Path, manifest_file, image_package=None) -> tuple[Path, Optional[Path]]:
-    uploads_dir = session_dir / "uploads"
+def persist_batch_uploads(upload_root: Path, manifest_file, image_package=None) -> tuple[Path, Optional[Path]]:
+    uploads_dir = upload_root / "uploads"
     manifest_path = local_path_from_input(manifest_file)
     persisted_manifest = copy_file_to_dir(manifest_path, uploads_dir)
     persisted_package = None
@@ -1413,7 +1415,7 @@ def resolve_batch_image_path(
     return resolved_path
 
 
-def prepare_batch_image_package(package_file, session_dir: Path) -> Optional[Path]:
+def prepare_batch_image_package(package_file, package_root: Path) -> Optional[Path]:
     if package_file is None:
         return None
 
@@ -1421,7 +1423,6 @@ def prepare_batch_image_package(package_file, session_dir: Path) -> Optional[Pat
     if package_path.suffix.lower() != ".zip":
         raise gr.Error("图片包仅支持 ZIP 格式。")
 
-    package_root = session_dir / "input_package"
     package_root.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -1509,8 +1510,8 @@ def batch_examples_markdown() -> str:
     return (
         "### 批量任务文件格式\n"
         "支持两种模式：\n"
-        f"- **{BATCH_MODE_LOCAL}**：管理员把图片放到项目目录 `{LOCAL_BATCH_INPUT_DIR.name}/` 下；普通用户放到 `{LOCAL_BATCH_INPUT_DIR.name}/users/<用户ID>/` 下，`images` 只写相对对应根目录的路径。\n"
-        f"- **{BATCH_MODE_REMOTE}**：上传 `CSV/JSON` + `ZIP` 图片包，`images` 必须写成相对 `ZIP` 根目录的路径。\n"
+        f"- **{BATCH_MODE_LOCAL}**：所有用户都把图片放到 `{LOCAL_BATCH_INPUT_DIR.name}/users/<用户名>/` 下，`images` 只写相对该目录的路径。\n"
+        f"- **{BATCH_MODE_REMOTE}**：上传 `CSV/JSON` + `ZIP` 图片包后，服务端会把 manifest、ZIP 和解压图片落到 `{LOCAL_BATCH_INPUT_DIR.name}/users/<用户名>/<任务ID>/` 下；`images` 必须写成相对 `ZIP` 根目录的路径。\n"
         "多图输入在 CSV 中使用 `|` 分隔。远程上传模式建议用 `generate_batch_manifest.py --image-path-mode package-relative` 生成任务文件；服务端本地图片模式建议用 `--image-path-mode project-relative`。\n"
         "批量推理界面仅展示总进度，并在全部任务完成后提供一个最终结果 ZIP 下载入口。\n"
         "单次推理与远程批量上传文件/结果会在服务器暂存 7 天，之后自动清理。\n\n"
@@ -1528,12 +1529,12 @@ def batch_mode_help_text(batch_mode: str) -> str:
             "**当前模式：远程上传**\n\n"
             "- 上传 `manifest + ZIP`。\n"
             "- `images` 必须写成 ZIP 内相对路径。\n"
-            "- 服务端会先把 manifest 和 ZIP 保存到本次会话目录，再从解压目录读取图片。"
+            f"- 服务端会把 manifest、ZIP 和解压图片保存到 `{LOCAL_BATCH_INPUT_DIR.name}/users/<用户名>/<任务ID>/` 下，再从该目录读取图片。"
         )
     return (
         "**当前模式：服务端本地图片**\n\n"
-        f"- 管理员请把图片手动放到项目目录 `{LOCAL_BATCH_INPUT_DIR.name}/` 下；普通用户放到 `{LOCAL_BATCH_INPUT_DIR.name}/users/<用户ID>/` 下。\n"
-        "- `images` 只能写文件名或相对对应图片根目录的路径。\n"
+        f"- 所有用户都把图片手动放到 `{LOCAL_BATCH_INPUT_DIR.name}/users/<用户名>/` 下。\n"
+        "- `images` 只能写文件名或相对该用户图片根目录的路径。\n"
         "- 不支持绝对路径，也不支持项目目录之外的图片路径。"
     )
 
@@ -1904,6 +1905,8 @@ def start_batch(manifest_file, batch_mode, image_package=None, request: gr.Reque
 
     session_dir = create_session_dir(user_jobs_root(user), "qwen_image_edit_batch")
     session_id = batch_session_id(session_dir)
+    batch_input_session_dir = user_local_batch_root(user) / session_id
+    batch_input_session_dir.mkdir(parents=True, exist_ok=True)
     session_type = "batch_remote" if batch_mode == BATCH_MODE_REMOTE else "batch_local"
     job = task_store.create_job(user["id"], session_type, session_dir, status=task_store.JOB_STATUS_QUEUED, batch_mode=batch_mode)
     metadata = initialize_session(session_dir, session_type=session_type)
@@ -1913,7 +1916,7 @@ def start_batch(manifest_file, batch_mode, image_package=None, request: gr.Reque
     metadata["batch_mode"] = batch_mode
 
     try:
-        persisted_manifest, persisted_package = persist_batch_uploads(session_dir, manifest_file, image_package)
+        persisted_manifest, persisted_package = persist_batch_uploads(batch_input_session_dir, manifest_file, image_package)
         metadata["manifest_file"] = str(persisted_manifest)
         job_update = {"manifest_file": str(persisted_manifest), "current_phase": "正在初始化"}
         if persisted_package is not None:
@@ -1921,7 +1924,7 @@ def start_batch(manifest_file, batch_mode, image_package=None, request: gr.Reque
             job_update["uploaded_package_file"] = str(persisted_package)
         task_store.update_job(job["id"], **job_update)
 
-        package_root = prepare_batch_image_package(persisted_package, session_dir)
+        package_root = prepare_batch_image_package(persisted_package, batch_input_session_dir / "input_package")
         if package_root is not None:
             metadata["extracted_package_dir"] = str(package_root)
             task_store.update_job(job["id"], extracted_package_dir=str(package_root))
