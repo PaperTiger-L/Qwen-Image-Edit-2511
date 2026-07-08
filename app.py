@@ -2282,8 +2282,7 @@ def build_demo() -> gr.Blocks:
             job_detail_button.click(load_job_detail, inputs=[job_id_input], outputs=[job_detail, job_download], queue=False, show_progress="hidden")
             demo.load(refresh_my_jobs, inputs=[my_status_filter], outputs=[jobs_table], queue=False, show_progress="hidden")
 
-        with gr.Group(visible=False) as admin_panel:
-            gr.Markdown("## 管理员面板")
+        with gr.Tab("管理员面板", visible=False) as admin_panel:
             gr.Markdown("### 用户管理")
             admin_refresh_button = gr.Button("刷新用户列表")
             admin_users_table = gr.Dataframe(
