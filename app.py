@@ -1565,6 +1565,21 @@ def reset_batch_outputs(batch_mode: str = BATCH_MODE_REMOTE):
 
 
 
+def reset_batch_submit_view(batch_mode: str = BATCH_MODE_REMOTE) -> tuple[str, str, Any, str, Any, Any, Any, Any, Any]:
+    return (
+        "",
+        "",
+        gr.update(value=None, visible=False),
+        "",
+        gr.update(active=False),
+        gr.update(interactive=False),
+        gr.update(value=batch_mode, interactive=False),
+        batch_mode_help_text(batch_mode),
+        gr.update(visible=batch_mode == BATCH_MODE_REMOTE),
+    )
+
+
+
 def job_metadata(job: dict[str, Any]) -> dict[str, Any]:
     status = job.get("status")
     session_type = job.get("job_type")
@@ -2171,7 +2186,7 @@ def build_demo() -> gr.Blocks:
             )
 
             batch_button.click(
-                reset_batch_outputs,
+                reset_batch_submit_view,
                 inputs=[batch_mode],
                 outputs=[
                     batch_progress,
