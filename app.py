@@ -1419,9 +1419,15 @@ def resolve_batch_image_path(
         if package_root is None:
             raise gr.Error("远程上传模式必须上传图片包 ZIP。")
         normalized_ref = normalize_relative_image_ref(image_ref, "远程上传模式")
-        resolved_path = (package_root / Path(*normalized_ref.parts)).resolve()
-        ensure_relative_to_root(resolved_path, package_root)
-        return resolved_path
+        candidates = [(package_root / Path(*normalized_ref.parts)).resolve()]
+        top_level_dirs = [item for item in package_root.iterdir() if item.is_dir()]
+        if len(top_level_dirs) == 1:
+            candidates.append((top_level_dirs[0] / Path(*normalized_ref.parts)).resolve())
+        for candidate in candidates:
+            ensure_relative_to_root(candidate, package_root)
+            if candidate.exists():
+                return candidate
+        return candidates[0]
 
     normalized_ref = normalize_relative_image_ref(image_ref, "服务端本地图片模式")
     resolved_path = (local_batch_root / Path(*normalized_ref.parts)).resolve()
@@ -1488,6 +1494,11 @@ def parse_batch_manifest(
         ]
         for image_ref, path in zip(image_refs, image_paths):
             if not path.exists():
+                if batch_mode == BATCH_MODE_REMOTE and package_root is not None:
+                    raise gr.Error(
+                        f"批量任务 {row_id} 的图片不存在: {image_ref}。"
+                        f"请检查该文件是否在 ZIP 根目录内，或 ZIP 是否额外包了一层目录。"
+                    )
                 raise gr.Error(f"批量任务 {row_id} 的图片不存在: {image_ref}")
         items.append(
             BatchItem(
